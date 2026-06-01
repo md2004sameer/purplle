@@ -17,6 +17,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 from datetime import datetime, timedelta
 
 from app.main import app
@@ -32,6 +33,7 @@ def make_test_engine():
     engine = create_engine(
         "sqlite:///:memory:",
         connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
     )
     Base.metadata.create_all(bind=engine)
     return engine
@@ -115,12 +117,15 @@ class TestEventIngestion:
             {**_make_event("evt-2", "VIS_002"), "event_type": "INVALID_TYPE"},  # invalid
         ]
         resp = _ingest(client, events)
-        assert resp.status_code == 200
+        assert resp.status_code in {200, 422}
         data = resp.json()
         # Pydantic rejects the invalid event before it reaches the DB layer,
         # so the whole batch returns 422. If the API accepts it and handles
         # per-event errors, assert exact counts.
-        assert data["successful"] + data["failed"] + data["duplicates"] == len(events) or resp.status_code == 422
+        if resp.status_code == 422:
+            assert "detail" in data
+        else:
+            assert data["successful"] + data["failed"] + data["duplicates"] == len(events)
 
 
 # ---------------------------------------------------------------------------

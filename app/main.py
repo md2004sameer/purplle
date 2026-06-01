@@ -579,8 +579,10 @@ async def health_check(db: Session = Depends(get_db)):
         for store_id, ts in LAST_EVENT_TIMESTAMP.items():
             last_event_per_store[store_id] = ts
             
-            # Check if stale (>10 min)
-            if datetime.utcnow() - ts > timedelta(minutes=10):
+            # Check if stale (>10 min). Event timestamps parsed from ISO-8601
+            # may be timezone-aware, while legacy/generated values can be naive.
+            now = datetime.now(ts.tzinfo) if ts.tzinfo else datetime.utcnow()
+            if now - ts > timedelta(minutes=10):
                 stale_feeds.append(store_id)
         
         return HealthResponse(
