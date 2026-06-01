@@ -493,7 +493,7 @@ async def health_check(db: Session = Depends(get_db)):
             db_status = "connected"
         except Exception as e:
             logger.warning(f"DB connectivity check failed: {str(e)}")
-            db_status = "connected"  # SQLite always ok if this far
+            db_status = "disconnected"
         
         stale_feeds = []
         last_event_per_store = {}

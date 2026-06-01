@@ -428,7 +428,7 @@ def process_all_clips(data_dir: str, store_id: str, store_layout_path: str = Non
     Returns:
         Combined list of events from all cameras
     """
-    # Auto-detect store_layout.json if not provided
+      # Auto-detect store_layout.json if not provided
     if store_layout_path is None:
         store_layout_path = os.path.join(os.path.dirname(data_dir), 'store_layout.json')
     
