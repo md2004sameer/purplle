@@ -575,3 +575,4 @@ Challenge submission for UpGrad Placements — April 2026.
 
 For questions about the implementation, see [DESIGN.md](docs/DESIGN.md) and [CHOICES.md](docs/CHOICES.md).
 
+# purplle
