@@ -18,22 +18,24 @@ degradation (return 503 on DB issues), and proper anomaly detection logic.
 
 import logging
 import time
-from datetime import datetime, timedelta
-from typing import Optional, List
+from datetime import datetime, timedelta, timezone
+from typing import Optional, List, Dict, Set, Tuple
 from contextlib import asynccontextmanager
 import json
 import uuid
 
 from fastapi import FastAPI, Depends, HTTPException, status, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
+from pydantic import ValidationError
 from sqlalchemy import and_, or_, func
 from sqlalchemy.orm import Session
 
 from app.database import init_db, get_db, engine, Store, Event, VisitorSession, POSTransaction, AnomalyRecord, APIMetadata
 from app.models import (
-    StoreEvent, EventBatch, IngestResponse, MetricsResponse,
+    StoreEvent, IngestResponse, MetricsResponse,
     FunnelResponse, FunnelStage, HeatmapResponse, HeatmapZone,
-    AnomaliesResponse, Anomaly, HealthResponse, ErrorResponse
+    AnomaliesResponse, Anomaly, HealthResponse, ErrorResponse,
+    POSTransactionBatch, POSIngestResponse
 )
 
 # Setup logging
@@ -46,6 +48,63 @@ logger = logging.getLogger(__name__)
 # Global state
 APP_START_TIME = time.time()
 LAST_EVENT_TIMESTAMP = {}
+
+
+def _as_naive_utc(value: datetime) -> datetime:
+    """Normalize aware datetimes before storing/querying SQLite."""
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def _converted_visitors_for_store(db: Session, store_id: str) -> Set[str]:
+    """
+    A visitor converts when they were in billing in the 5-minute window
+    before a transaction timestamp for the same store.
+    """
+    converted: Set[str] = set()
+    transactions = db.query(POSTransaction).filter(
+        POSTransaction.store_id == store_id
+    ).all()
+
+    for transaction in transactions:
+        window_start = transaction.timestamp - timedelta(minutes=5)
+        billing_visitors = db.query(Event.visitor_id).filter(
+            and_(
+                Event.store_id == store_id,
+                Event.is_staff == False,
+                Event.timestamp >= window_start,
+                Event.timestamp <= transaction.timestamp,
+                or_(
+                    Event.zone_id == 'BILLING',
+                    Event.event_type == 'BILLING_QUEUE_JOIN',
+                ),
+            )
+        ).distinct().all()
+        converted.update(visitor_id for (visitor_id,) in billing_visitors)
+
+    return converted
+
+
+def _queue_abandonment_rate(db: Session, store_id: str) -> Optional[float]:
+    joins = db.query(func.count(Event.event_id)).filter(
+        and_(
+            Event.store_id == store_id,
+            Event.event_type == 'BILLING_QUEUE_JOIN',
+            Event.is_staff == False,
+        )
+    ).scalar() or 0
+    if joins == 0:
+        return None
+
+    abandons = db.query(func.count(Event.event_id)).filter(
+        and_(
+            Event.store_id == store_id,
+            Event.event_type == 'BILLING_QUEUE_ABANDON',
+            Event.is_staff == False,
+        )
+    ).scalar() or 0
+    return (abandons / joins) * 100
 
 
 @asynccontextmanager
@@ -90,7 +149,7 @@ async def log_requests(request: Request, call_next):
 
 @app.post("/events/ingest", response_model=IngestResponse)
 async def ingest_events(
-    batch: EventBatch,
+    request: Request,
     db: Session = Depends(get_db),
     background_tasks: BackgroundTasks = None
 ):
@@ -101,20 +160,39 @@ async def ingest_events(
     Partial success: malformed events are skipped with error report.
     """
     try:
+        payload = await request.json()
+        raw_events = payload.get("events") if isinstance(payload, dict) else None
+        if not isinstance(raw_events, list):
+            raise HTTPException(status_code=422, detail="Request body must contain an events list")
+        if len(raw_events) > 500:
+            raise HTTPException(status_code=422, detail="Batch size must be <= 500 events")
+
         successful = 0
         failed = 0
         duplicates = 0
         errors = []
-        
+
+        validated_events: List[StoreEvent] = []
+        for idx, raw_event in enumerate(raw_events):
+            try:
+                validated_events.append(StoreEvent.model_validate(raw_event))
+            except ValidationError as e:
+                failed += 1
+                errors.append({
+                    "index": idx,
+                    "event_id": raw_event.get("event_id") if isinstance(raw_event, dict) else None,
+                    "error": e.errors(),
+                })
+
         # Ensure stores exist
-        store_ids = set(e.store_id for e in batch.events)
+        store_ids = set(e.store_id for e in validated_events)
         for store_id in store_ids:
             existing = db.query(Store).filter(Store.store_id == store_id).first()
             if not existing:
                 db.add(Store(store_id=store_id))
         db.commit()
         
-        for event_data in batch.events:
+        for event_data in validated_events:
             try:
                 # Check for duplicate
                 existing_event = db.query(Event).filter(Event.event_id == event_data.event_id).first()
@@ -129,7 +207,7 @@ async def ingest_events(
                     camera_id=event_data.camera_id,
                     visitor_id=event_data.visitor_id,
                     event_type=event_data.event_type.value,
-                    timestamp=event_data.timestamp,
+                    timestamp=_as_naive_utc(event_data.timestamp),
                     zone_id=event_data.zone_id,
                     dwell_ms=event_data.dwell_ms,
                     is_staff=event_data.is_staff,
@@ -140,7 +218,7 @@ async def ingest_events(
                 successful += 1
                 
                 # Update last event timestamp
-                LAST_EVENT_TIMESTAMP[event_data.store_id] = event_data.timestamp
+                LAST_EVENT_TIMESTAMP[event_data.store_id] = _as_naive_utc(event_data.timestamp)
                 
             except Exception as e:
                 failed += 1
@@ -158,8 +236,73 @@ async def ingest_events(
             errors=errors,
         )
     
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Event ingestion error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database unavailable"
+        )
+
+
+@app.post("/pos/ingest", response_model=POSIngestResponse)
+async def ingest_pos_transactions(
+    batch: POSTransactionBatch,
+    db: Session = Depends(get_db),
+):
+    """Ingest POS transactions used for store-level conversion correlation."""
+    successful = 0
+    failed = 0
+    duplicates = 0
+    errors = []
+
+    try:
+        store_ids = {txn.store_id for txn in batch.transactions}
+        for store_id in store_ids:
+            existing = db.query(Store).filter(Store.store_id == store_id).first()
+            if not existing:
+                db.add(Store(store_id=store_id))
+        db.commit()
+
+        for txn in batch.transactions:
+            try:
+                existing = db.query(POSTransaction).filter(
+                    POSTransaction.transaction_id == txn.transaction_id
+                ).first()
+                if existing:
+                    duplicates += 1
+                    continue
+
+                db.add(POSTransaction(
+                    transaction_id=txn.transaction_id,
+                    store_id=txn.store_id,
+                    timestamp=_as_naive_utc(txn.timestamp),
+                    amount=txn.basket_value_inr,
+                    raw_data={
+                        "store_id": txn.store_id,
+                        "transaction_id": txn.transaction_id,
+                        "timestamp": _as_naive_utc(txn.timestamp).isoformat() + "Z",
+                        "basket_value_inr": txn.basket_value_inr,
+                    },
+                ))
+                successful += 1
+            except Exception as e:
+                failed += 1
+                errors.append({
+                    "transaction_id": txn.transaction_id,
+                    "error": str(e),
+                })
+
+        db.commit()
+        return POSIngestResponse(
+            successful=successful,
+            failed=failed,
+            duplicates=duplicates,
+            errors=errors,
+        )
+    except Exception as e:
+        logger.error(f"POS ingestion error: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Database unavailable"
@@ -200,11 +343,12 @@ async def get_metrics(store_id: str, db: Session = Depends(get_db)):
         
         transaction_count = len(transactions)
         total_sales = sum(t.amount for t in transactions)
+        converted_visitors = _converted_visitors_for_store(db, store_id)
         
         # Compute conversion rate
         conversion_rate = None
-        if entry_events > 0:
-            conversion_rate = (transaction_count / entry_events) * 100
+        if unique_visitor_count > 0:
+            conversion_rate = (len(converted_visitors) / unique_visitor_count) * 100
         
         # Avg dwell per zone
         avg_dwell_per_zone = {}
@@ -243,7 +387,7 @@ async def get_metrics(store_id: str, db: Session = Depends(get_db)):
             conversion_rate=conversion_rate,
             avg_dwell_per_zone=avg_dwell_per_zone,
             current_queue_depth=queue_depth,
-            queue_abandonment_rate=None,
+            queue_abandonment_rate=_queue_abandonment_rate(db, store_id),
             transactions_count=transaction_count,
             total_sales=total_sales,
             data_quality_score=0.85,
@@ -293,10 +437,9 @@ async def get_funnel(store_id: str, db: Session = Depends(get_db)):
             )
         ).scalar() or 0
         
-        # Stage 4: Purchase
-        transactions = db.query(POSTransaction).filter(
-            POSTransaction.store_id == store_id
-        ).count()
+        # Stage 4: Purchase — visitor-level POS correlation, not raw transaction count.
+        converted_visitors = _converted_visitors_for_store(db, store_id)
+        converted_count = len(converted_visitors)
         
         # Compute drop-offs
         funnel_stages = [
@@ -320,20 +463,20 @@ async def get_funnel(store_id: str, db: Session = Depends(get_db)):
             ),
             FunnelStage(
                 stage="Purchase",
-                visitor_count=transactions,
-                drop_off_pct=100 * (1 - (transactions / billing_visitors if billing_visitors > 0 else 0)),
+                visitor_count=converted_count,
+                drop_off_pct=100 * (1 - (converted_count / billing_visitors if billing_visitors > 0 else 0)),
                 next_stage=None
             ),
         ]
         
-        conversion_rate = (transactions / entries * 100) if entries > 0 else 0
+        conversion_rate = (converted_count / entries * 100) if entries > 0 else 0
         
         return FunnelResponse(
             store_id=store_id,
             timestamp=datetime.utcnow(),
             funnel=funnel_stages,
             total_visitors=entries,
-            converted_visitors=transactions,
+            converted_visitors=converted_count,
             conversion_rate=conversion_rate,
         )
     
