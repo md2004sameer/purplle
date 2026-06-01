@@ -1,0 +1,213 @@
+{
+  "store_id": "STORE_BLR_001",
+  "store_name": "Brigade Road - Bangalore",
+  "address": "Brigade Road, Bangalore, India",
+  "store_hours": {
+    "open": "10:00",
+    "close": "21:00"
+  },
+  "physical_dimensions": {
+    "width_mm": 4000,
+    "depth_mm": 3941,
+    "area_sqm": 15.8
+  },
+  "camera_specs": {
+    "resolution": "1920x1080",
+    "fps": 30,
+    "aspect_ratio": "16:9",
+    "pixel_to_mm_h": 2.08,
+    "pixel_to_mm_v": 3.65
+  },
+  "zones": [
+    {
+      "zone_id": "ENTRANCE",
+      "zone_name": "Entrance Area",
+      "description": "Store entry point - visitor detection zone",
+      "product_category": "Entry/Exit",
+      "priority": "CRITICAL",
+      "bbox": {
+        "x_min": 0,
+        "y_min": 400,
+        "x_max": 350,
+        "y_max": 680,
+        "center_x": 175,
+        "center_y": 540
+      }
+    },
+    {
+      "zone_id": "TOP_BRANDS",
+      "zone_name": "Premium Brands Zone (Top Row)",
+      "description": "Premium skincare brands - EB Korean, The Face Shop, Good Vibes, DermDoc, Minimalist, Aqualogia, Lakme Skin",
+      "product_category": "Skincare, Premium",
+      "priority": "HIGH",
+      "brands": ["EB Korean", "The Face Shop", "Good Vibes", "DermDoc", "Minimalist", "Aqualogia", "Lakme Skin"],
+      "bbox": {
+        "x_min": 50,
+        "y_min": 0,
+        "x_max": 950,
+        "y_max": 270,
+        "center_x": 500,
+        "center_y": 135
+      }
+    },
+    {
+      "zone_id": "BOTTOM_BRANDS",
+      "zone_name": "Mass-Market Brands Zone (Bottom Row)",
+      "description": "Mass-market brands - Maybelline, Faces Canada, Lakme, Colorbar, Swiss Beauty, Renee NY Base, Alps Goodness, Streax",
+      "product_category": "Makeup, Mass-Market",
+      "priority": "HIGH",
+      "brands": ["Maybelline", "Faces Canada", "Lakme", "Colorbar", "Swiss Beauty", "Renee NY Base", "Alps Goodness", "Streax"],
+      "bbox": {
+        "x_min": 50,
+        "y_min": 810,
+        "x_max": 950,
+        "y_max": 1080,
+        "center_x": 500,
+        "center_y": 945
+      }
+    },
+    {
+      "zone_id": "CENTER_AREA",
+      "zone_name": "Center/F.O.H Area",
+      "description": "Open floor space - main customer movement hub with makeup units",
+      "product_category": "Floor Space",
+      "priority": "HIGH",
+      "bbox": {
+        "x_min": 550,
+        "y_min": 270,
+        "x_max": 1200,
+        "y_max": 810,
+        "center_x": 875,
+        "center_y": 540
+      }
+    },
+    {
+      "zone_id": "MAKEUP_UNITS",
+      "zone_name": "Makeup Island Units",
+      "description": "2 makeup display units - island style in center floor",
+      "product_category": "Makeup",
+      "priority": "HIGH",
+      "sub_zones": [
+        {
+          "unit": 1,
+          "bbox": {
+            "x_min": 600,
+            "y_min": 350,
+            "x_max": 750,
+            "y_max": 500,
+            "center_x": 675,
+            "center_y": 425
+          }
+        },
+        {
+          "unit": 2,
+          "bbox": {
+            "x_min": 800,
+            "y_min": 400,
+            "x_max": 950,
+            "y_max": 550,
+            "center_x": 875,
+            "center_y": 475
+          }
+        }
+      ]
+    },
+    {
+      "zone_id": "FRAGRANCE",
+      "zone_name": "Fragrance Cabinet",
+      "description": "Premium fragrance - 3-sided island display fixture in center",
+      "product_category": "Fragrance, Premium",
+      "priority": "MEDIUM",
+      "bbox": {
+        "x_min": 750,
+        "y_min": 405,
+        "x_max": 1050,
+        "y_max": 630,
+        "center_x": 900,
+        "center_y": 518
+      }
+    },
+    {
+      "zone_id": "ACCESSORIES",
+      "zone_name": "Accessories Zone",
+      "description": "Accessories display - right side, lower traffic",
+      "product_category": "Accessories",
+      "priority": "MEDIUM",
+      "bbox": {
+        "x_min": 950,
+        "y_min": 90,
+        "x_max": 1050,
+        "y_max": 360,
+        "center_x": 1000,
+        "center_y": 225
+      }
+    },
+    {
+      "zone_id": "BILLING",
+      "zone_name": "Cash Corner / Billing Area",
+      "description": "Payment processing counter - CRITICAL for conversion tracking",
+      "product_category": "Checkout",
+      "priority": "CRITICAL",
+      "dwell_time_threshold_ms": 15000,
+      "bbox": {
+        "x_min": 975,
+        "y_min": 68,
+        "x_max": 1050,
+        "y_max": 202,
+        "center_x": 1013,
+        "center_y": 135
+      }
+    }
+  ],
+  "cameras": [
+    {
+      "camera_id": "CAM 1",
+      "position": "Entry Point",
+      "angle_degrees": 0,
+      "coverage": ["ENTRANCE", "TOP_BRANDS", "CENTER_AREA"],
+      "video_file": "CAM 1.mp4"
+    },
+    {
+      "camera_id": "CAM 2",
+      "position": "Main Floor",
+      "angle_degrees": 0,
+      "coverage": ["CENTER_AREA", "MAKEUP_UNITS", "FRAGRANCE"],
+      "video_file": "CAM 2.mp4"
+    },
+    {
+      "camera_id": "CAM 3",
+      "position": "Billing Area",
+      "angle_degrees": 0,
+      "coverage": ["BILLING", "ACCESSORIES", "TOP_BRANDS"],
+      "video_file": "CAM 3.mp4"
+    },
+    {
+      "camera_id": "CAM 4",
+      "position": "Bottom Display",
+      "angle_degrees": 0,
+      "coverage": ["BOTTOM_BRANDS", "CENTER_AREA"],
+      "video_file": "CAM 4.mp4"
+    },
+    {
+      "camera_id": "CAM 5",
+      "position": "Wide Angle",
+      "angle_degrees": 0,
+      "coverage": ["TOP_BRANDS", "BOTTOM_BRANDS", "CENTER_AREA"],
+      "video_file": "CAM 5.mp4"
+    }
+  ],
+  "zone_hierarchy": {
+    "critical_zones": ["ENTRANCE", "BILLING"],
+    "high_traffic_zones": ["TOP_BRANDS", "BOTTOM_BRANDS", "CENTER_AREA"],
+    "conversion_path": ["ENTRANCE", "TOP_BRANDS", "CENTER_AREA", "MAKEUP_UNITS", "FRAGRANCE", "BILLING"],
+    "dwell_zones": ["TOP_BRANDS", "MAKEUP_UNITS", "FRAGRANCE", "ACCESSORIES"]
+  },
+  "business_rules": {
+    "entry_threshold_frames": 5,
+    "exit_threshold_frames": 3,
+    "zone_dwell_minimum_ms": 2000,
+    "billing_conversion_window_ms": 300000,
+    "staff_detection_zone_transitions": 4,
+    "staff_detection_never_billing": true
+  }
+}
