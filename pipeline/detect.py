@@ -567,7 +567,6 @@ def process_all_clips(data_dir: str, store_id: str, store_layout_path: str = Non
     # Load zones from JSON
     zones = load_zones_from_json(store_layout_path)
     
-    pipeline = DetectionPipeline()
     all_events = []
     
     for filename in sorted(os.listdir(data_dir)):
@@ -575,6 +574,8 @@ def process_all_clips(data_dir: str, store_id: str, store_layout_path: str = Non
             video_path = os.path.join(data_dir, filename)
             camera_id = filename.replace('.mp4', '')
             
+            # Create new pipeline for each camera to avoid track ID collisions
+            pipeline = DetectionPipeline()
             events = pipeline.process_clip(video_path, store_id, camera_id, zones)
             all_events.extend(events)
     
