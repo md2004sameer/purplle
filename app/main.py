@@ -67,6 +67,48 @@ def _as_naive_utc(value: datetime) -> datetime:
     return value.astimezone(timezone.utc).replace(tzinfo=None)
 
 
+def _last_event_metadata_key(store_id: str) -> str:
+    return f"last_event_timestamp:{store_id}"
+
+
+def _set_last_event_timestamp(db: Session, events: List[StoreEvent]) -> None:
+    """
+    Persist the latest event timestamp per store.
+
+    Multiple events for the same store can arrive in one batch, so collapse the
+    batch to one upsert per store before touching APIMetadata's unique key.
+    """
+    latest_by_store: Dict[str, datetime] = {}
+    for event_data in events:
+        timestamp = _as_naive_utc(event_data.timestamp)
+        existing = latest_by_store.get(event_data.store_id)
+        if existing is None or timestamp > existing:
+            latest_by_store[event_data.store_id] = timestamp
+
+    if not latest_by_store:
+        return
+
+    keys_by_store = {
+        store_id: _last_event_metadata_key(store_id)
+        for store_id in latest_by_store
+    }
+    existing_metadata = db.query(APIMetadata).filter(
+        APIMetadata.key.in_(keys_by_store.values())
+    ).all()
+    metadata_by_key = {metadata.key: metadata for metadata in existing_metadata}
+
+    for store_id, timestamp in latest_by_store.items():
+        LAST_EVENT_TIMESTAMP[store_id] = timestamp
+        key = keys_by_store[store_id]
+        value = timestamp.isoformat() + "Z"
+        metadata = metadata_by_key.get(key)
+        if metadata:
+            metadata.value = value
+            metadata.updated_at = _utc_now_naive()
+        else:
+            db.add(APIMetadata(key=key, value=value))
+
+
 def _converted_visitors_for_store(db: Session, store_id: str) -> Set[str]:
     """
     A visitor converts when they were in billing in the 5-minute window
@@ -237,6 +279,7 @@ async def ingest_events(
                 db.add(Store(store_id=store_id))
         db.commit()
         
+        stored_events: List[StoreEvent] = []
         for event_data in validated_events:
             try:
                 # Check for duplicate
@@ -261,9 +304,7 @@ async def ingest_events(
                 )
                 db.add(event)
                 successful += 1
-                
-                # Update last event timestamp
-                LAST_EVENT_TIMESTAMP[event_data.store_id] = _as_naive_utc(event_data.timestamp)
+                stored_events.append(event_data)
                 
             except Exception as e:
                 failed += 1
@@ -271,7 +312,8 @@ async def ingest_events(
                     "event_id": event_data.event_id,
                     "error": str(e)
                 })
-        
+
+        _set_last_event_timestamp(db, stored_events)
         db.commit()
         
         return IngestResponse(

@@ -19,7 +19,7 @@ from sqlalchemy.pool import StaticPool
 from datetime import datetime, timedelta
 
 from app.main import app
-from app.database import Base, get_db
+from app.database import APIMetadata, Base, get_db
 from app.models import StoreEvent, EventType
 
 
@@ -87,6 +87,13 @@ def _ingest_pos(client, transactions):
     return client.post("/pos/ingest", json={"transactions": transactions})
 
 
+def _db_session_for_client(client):
+    override = app.dependency_overrides[get_db]
+    db_generator = override()
+    db = next(db_generator)
+    return db, db_generator
+
+
 # ---------------------------------------------------------------------------
 # Event Ingestion
 # ---------------------------------------------------------------------------
@@ -125,6 +132,29 @@ class TestEventIngestion:
         assert data["failed"] == 1
         assert data["duplicates"] == 0
         assert data["errors"][0]["event_id"] == "evt-2"
+
+    def test_ingest_multiple_same_store_updates_one_last_event_metadata_row(self, client):
+        """Last-event metadata is deduped per store within a single batch."""
+        events = [
+            _make_event("evt-1", "VIS_001", timestamp="2026-04-10T10:00:00Z"),
+            _make_event("evt-2", "VIS_002", timestamp="2026-04-10T10:05:00Z"),
+            _make_event("evt-3", "VIS_003", timestamp="2026-04-10T10:03:00Z"),
+        ]
+
+        resp = _ingest(client, events)
+        assert resp.status_code == 200
+        assert resp.json()["successful"] == 3
+
+        db, db_generator = _db_session_for_client(client)
+        try:
+            rows = db.query(APIMetadata).filter(
+                APIMetadata.key == "last_event_timestamp:STORE_TEST"
+            ).all()
+            assert len(rows) == 1
+            assert rows[0].value == "2026-04-10T10:05:00Z"
+        finally:
+            db.close()
+            db_generator.close()
 
 
 class TestPOSIngestion:
