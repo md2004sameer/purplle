@@ -21,8 +21,69 @@ import json
 import uuid
 from typing import List, Dict, Optional, Tuple
 import logging
+import os
 
 logger = logging.getLogger(__name__)
+
+
+def load_zones_from_json(store_layout_path: str) -> Dict[str, Dict]:
+    """
+    Load zone definitions from store_layout.json.
+    
+    Args:
+        store_layout_path: Path to store_layout.json
+    
+    Returns:
+        Dict with zone_id -> zone definition
+    """
+    with open(store_layout_path, 'r') as f:
+        layout = json.load(f)
+    
+    zones = {}
+    for zone in layout.get('zones', []):
+        zone_id = zone['zone_id']
+        
+        # Handle zones with sub_zones (e.g., MAKEUP_UNITS)
+        if 'sub_zones' in zone:
+            # Aggregate sub-zones into a combined bounding box
+            all_x_mins = []
+            all_x_maxs = []
+            all_y_mins = []
+            all_y_maxs = []
+            
+            for sub_zone in zone['sub_zones']:
+                bbox = sub_zone['bbox']
+                all_x_mins.append(bbox['x_min'])
+                all_x_maxs.append(bbox['x_max'])
+                all_y_mins.append(bbox['y_min'])
+                all_y_maxs.append(bbox['y_max'])
+            
+            combined_bbox = {
+                'x_min': min(all_x_mins),
+                'x_max': max(all_x_maxs),
+                'y_min': min(all_y_mins),
+                'y_max': max(all_y_maxs),
+            }
+            combined_bbox['center_x'] = (combined_bbox['x_min'] + combined_bbox['x_max']) / 2
+            combined_bbox['center_y'] = (combined_bbox['y_min'] + combined_bbox['y_max']) / 2
+            bbox = combined_bbox
+        else:
+            bbox = zone['bbox']
+        
+        zones[zone_id] = {
+            'x_min': bbox['x_min'],
+            'x_max': bbox['x_max'],
+            'y_min': bbox['y_min'],
+            'y_max': bbox['y_max'],
+            'center_x': bbox.get('center_x', (bbox['x_min'] + bbox['x_max']) / 2),
+            'center_y': bbox.get('center_y', (bbox['y_min'] + bbox['y_max']) / 2),
+            'name': zone['zone_name'],
+            'priority': zone.get('priority', 'MEDIUM'),
+            'description': zone.get('description', ''),
+        }
+    
+    logger.info(f"Loaded {len(zones)} zones from {store_layout_path}")
+    return zones
 
 
 class PersonTracker:
@@ -355,22 +416,28 @@ class DetectionPipeline:
         return emitter.events
 
 
-def process_all_clips(data_dir: str, store_id: str, zones: Dict[str, Dict]) -> List[Dict]:
+def process_all_clips(data_dir: str, store_id: str, store_layout_path: str = None) -> List[Dict]:
     """
     Process all camera clips for a store and combine events.
     
     Args:
         data_dir: Directory containing CAM_*.mp4 files
         store_id: Store identifier
-        zones: Zone definitions
+        store_layout_path: Path to store_layout.json (auto-detected if None)
     
     Returns:
         Combined list of events from all cameras
     """
+    # Auto-detect store_layout.json if not provided
+    if store_layout_path is None:
+        store_layout_path = os.path.join(os.path.dirname(data_dir), 'store_layout.json')
+    
+    # Load zones from JSON
+    zones = load_zones_from_json(store_layout_path)
+    
     pipeline = DetectionPipeline()
     all_events = []
     
-    import os
     for filename in sorted(os.listdir(data_dir)):
         if filename.endswith('.mp4'):
             video_path = os.path.join(data_dir, filename)
