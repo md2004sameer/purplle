@@ -22,6 +22,7 @@ import uuid
 from typing import List, Dict, Optional, Tuple
 import logging
 import os
+import argparse
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +41,23 @@ def load_zones_from_json(store_layout_path: str) -> Dict[str, Dict]:
         layout = json.load(f)
     
     zones = {}
-    for zone in layout.get('zones', []):
+    raw_zones = layout.get('zones', [])
+    if isinstance(raw_zones, dict):
+        raw_zones = [
+            {
+                'zone_id': zone_id,
+                'zone_name': zone_def.get('name', zone_id),
+                'bbox': {
+                    'x_min': zone_def['x_min'],
+                    'x_max': zone_def['x_max'],
+                    'y_min': zone_def['y_min'],
+                    'y_max': zone_def['y_max'],
+                },
+            }
+            for zone_id, zone_def in raw_zones.items()
+        ]
+
+    for zone in raw_zones:
         zone_id = zone['zone_id']
         
         # Handle zones with sub_zones (e.g., MAKEUP_UNITS)
@@ -77,7 +94,7 @@ def load_zones_from_json(store_layout_path: str) -> Dict[str, Dict]:
             'y_max': bbox['y_max'],
             'center_x': bbox.get('center_x', (bbox['x_min'] + bbox['x_max']) / 2),
             'center_y': bbox.get('center_y', (bbox['y_min'] + bbox['y_max']) / 2),
-            'name': zone['zone_name'],
+            'name': zone.get('zone_name', zone_id),
             'priority': zone.get('priority', 'MEDIUM'),
             'description': zone.get('description', ''),
         }
@@ -290,6 +307,24 @@ class EventEmitter:
         }
         self.events.append(event)
         return event
+
+    def emit_reentry_event(self, visitor_id: str, timestamp: datetime) -> Dict:
+        """Emit REENTRY when a previously exited visitor appears again."""
+        event = {
+            'event_id': str(uuid.uuid4()),
+            'store_id': self.store_id,
+            'camera_id': self.camera_id,
+            'visitor_id': visitor_id,
+            'event_type': 'REENTRY',
+            'timestamp': timestamp.isoformat() + 'Z',
+            'zone_id': None,
+            'dwell_ms': 0,
+            'is_staff': False,
+            'confidence': 0.9,
+            'metadata': {},
+        }
+        self.events.append(event)
+        return event
     
     def emit_zone_event(self, visitor_id: str, zone_id: str, event_type: str, 
                        timestamp: datetime, dwell_ms: int = 0, confidence: float = 0.9) -> Dict:
@@ -352,6 +387,8 @@ class DetectionPipeline:
             List of structured events
         """
         cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise ValueError(f"Cannot open video: {video_path}")
         
         fps = cap.get(cv2.CAP_PROP_FPS)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -367,6 +404,8 @@ class DetectionPipeline:
         # visitor_states: visitor_id -> {'last_frame': int, 'zone_history': List[str], 'is_staff': bool}
         # Tracks first/last appearance so we can emit ENTRY and EXIT correctly.
         visitor_states: Dict[str, Dict] = {}
+        exited_visitors: Dict[str, datetime] = {}
+        queue_members: set = set()
 
         # How many frames of absence before we declare a visitor has exited.
         # 2 seconds of gap handles momentary occlusion without false exits.
@@ -412,8 +451,12 @@ class DetectionPipeline:
                         'last_frame': frame_idx,
                         'zone_history': [],
                         'is_staff': False,
+                        'last_dwell_emit': {},
                     }
-                    emitter.emit_entry_event(visitor_id, timestamp)
+                    if visitor_id in exited_visitors:
+                        emitter.emit_reentry_event(visitor_id, timestamp)
+                    else:
+                        emitter.emit_entry_event(visitor_id, timestamp)
                 else:
                     visitor_states[visitor_id]['last_frame'] = frame_idx
 
@@ -451,8 +494,35 @@ class DetectionPipeline:
                         )
                         evt['is_staff'] = is_staff
                         visitor_zones[visitor_id]['dwell_start'] = timestamp
+                        visitor_states[visitor_id]['last_dwell_emit'][zone_id] = timestamp
+
+                        if zone_id == 'BILLING':
+                            billing_active = sum(
+                                1 for active_id in active_visitor_ids
+                                if visitor_zones[active_id]['current'] == 'BILLING'
+                            )
+                            if billing_active > 0 and visitor_id not in queue_members:
+                                queue_evt = emitter.emit_queue_event(
+                                    visitor_id, billing_active, timestamp
+                                )
+                                queue_evt['is_staff'] = is_staff
+                                queue_evt['confidence'] = conf
+                                queue_members.add(visitor_id)
 
                     visitor_zones[visitor_id]['current'] = zone_id
+
+                if zone_id is not None and visitor_zones[visitor_id]['dwell_start'] is not None:
+                    last_emit = visitor_states[visitor_id]['last_dwell_emit'].get(zone_id)
+                    if last_emit and (timestamp - last_emit).total_seconds() >= 30:
+                        dwell_ms = int(
+                            (timestamp - visitor_zones[visitor_id]['dwell_start'])
+                            .total_seconds() * 1000
+                        )
+                        evt = emitter.emit_zone_event(
+                            visitor_id, zone_id, 'ZONE_DWELL', timestamp, dwell_ms, conf
+                        )
+                        evt['is_staff'] = is_staff
+                        visitor_states[visitor_id]['last_dwell_emit'][zone_id] = timestamp
 
             # --- EXIT: emit for visitors absent long enough to be considered gone ---
             for visitor_id, state in list(visitor_states.items()):
@@ -463,6 +533,8 @@ class DetectionPipeline:
                     )
                     evt = emitter.emit_exit_event(visitor_id, exit_ts)
                     evt['is_staff'] = state['is_staff']
+                    exited_visitors[visitor_id] = exit_ts
+                    queue_members.discard(visitor_id)
                     del visitor_states[visitor_id]
 
             frame_idx += 1
@@ -513,3 +585,35 @@ def process_all_clips(data_dir: str, store_id: str, store_layout_path: str = Non
     all_events.sort(key=lambda e: e['timestamp'])
     
     return all_events
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Process CCTV clips and emit Store Intelligence events as JSONL."
+    )
+    parser.add_argument("--video_dir", required=True, help="Directory containing .mp4 clips")
+    parser.add_argument("--store_id", required=True, help="Store ID, e.g. STORE_BLR_002")
+    parser.add_argument(
+        "--store_layout",
+        default=None,
+        help="Path to store_layout.json. Defaults to sibling of video_dir.",
+    )
+    parser.add_argument(
+        "--output",
+        default="events_output/events.jsonl",
+        help="JSONL output path for emitted events.",
+    )
+    args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO)
+    events = process_all_clips(args.video_dir, args.store_id, args.store_layout)
+
+    output_dir = os.path.dirname(args.output)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    with open(args.output, "w") as f:
+        for event in events:
+            f.write(json.dumps(event) + "\n")
+
+    logger.info("Wrote %s events to %s", len(events), args.output)
