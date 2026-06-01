@@ -9,311 +9,295 @@ consistency, funnel deduplication, anomaly detection logic.
 CHANGES MADE: Added custom assertions for funnel drop-off calculation accuracy,
 added tests for re-entry visitor deduplication, added queue depth anomaly
 detection validation, explicit tests for is_staff filtering in all metrics.
+Fixed DB isolation (each test gets its own in-memory SQLite engine),
+fixed funnel drop-off assertion logic, strengthened partial-failure assertions.
 """
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 from datetime import datetime, timedelta
+
 from app.main import app
-from app.database import SessionLocal, Base, engine
+from app.database import Base, get_db
 from app.models import StoreEvent, EventType
 
-# Create test client
-client = TestClient(app)
 
-@pytest.fixture(scope="function")
-def setup_db():
-    """Create and drop test database for each test."""
+# ---------------------------------------------------------------------------
+# Test DB isolation — each test function gets a fresh in-memory database.
+# ---------------------------------------------------------------------------
+
+def make_test_engine():
+    engine = create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+    )
     Base.metadata.create_all(bind=engine)
-    yield
-    Base.metadata.drop_all(bind=engine)
+    return engine
 
+
+@pytest.fixture
+def client():
+    """FastAPI test client wired to a fresh in-memory DB per test."""
+    test_engine = make_test_engine()
+    TestingSession = sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
+
+    def override_get_db():
+        db = TestingSession()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    app.dependency_overrides[get_db] = override_get_db
+    with TestClient(app) as c:
+        yield c
+    app.dependency_overrides.clear()
+    Base.metadata.drop_all(bind=test_engine)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _make_event(event_id, visitor_id, event_type="ENTRY", store_id="STORE_TEST",
+                is_staff=False, zone_id=None, dwell_ms=0,
+                timestamp="2026-04-10T16:55:36Z"):
+    return {
+        "event_id": event_id,
+        "store_id": store_id,
+        "camera_id": "CAM_1",
+        "visitor_id": visitor_id,
+        "event_type": event_type,
+        "timestamp": timestamp,
+        "zone_id": zone_id,
+        "dwell_ms": dwell_ms,
+        "is_staff": is_staff,
+        "confidence": 0.95,
+        "metadata": {},
+    }
+
+
+def _ingest(client, events):
+    return client.post("/events/ingest", json={"events": events})
+
+
+# ---------------------------------------------------------------------------
+# Event Ingestion
+# ---------------------------------------------------------------------------
 
 class TestEventIngestion:
-    """Test POST /events/ingest endpoint."""
-    
-    def test_ingest_valid_batch(self, setup_db):
+
+    def test_ingest_valid_batch(self, client):
         """Ingest batch of valid events."""
-        payload = {
-            "events": [
-                {
-                    "event_id": "test-event-1",
-                    "store_id": "STORE_BLR_001",
-                    "camera_id": "CAM_1",
-                    "visitor_id": "VIS_001",
-                    "event_type": "ENTRY",
-                    "timestamp": "2026-04-10T16:55:36Z",
-                    "zone_id": None,
-                    "dwell_ms": 0,
-                    "is_staff": False,
-                    "confidence": 0.95,
-                    "metadata": {}
-                }
-            ]
-        }
-        
-        response = client.post("/events/ingest", json=payload)
-        assert response.status_code == 200
-        data = response.json()
+        resp = _ingest(client, [_make_event("evt-1", "VIS_001")])
+        assert resp.status_code == 200
+        data = resp.json()
         assert data["successful"] == 1
         assert data["failed"] == 0
         assert data["duplicates"] == 0
-    
-    def test_ingest_duplicate_events(self, setup_db):
-        """Test that duplicate event_ids are detected."""
-        payload = {
-            "events": [
-                {
-                    "event_id": "test-event-1",
-                    "store_id": "STORE_BLR_001",
-                    "camera_id": "CAM_1",
-                    "visitor_id": "VIS_001",
-                    "event_type": "ENTRY",
-                    "timestamp": "2026-04-10T16:55:36Z",
-                    "zone_id": None,
-                    "dwell_ms": 0,
-                    "is_staff": False,
-                    "confidence": 0.95,
-                    "metadata": {}
-                }
-            ]
-        }
-        
-        # First ingest
-        response1 = client.post("/events/ingest", json=payload)
-        assert response1.json()["successful"] == 1
-        
-        # Second ingest (duplicate)
-        response2 = client.post("/events/ingest", json=payload)
-        data = response2.json()
+
+    def test_ingest_duplicate_events(self, client):
+        """Duplicate event_ids are detected and counted, not double-stored."""
+        event = [_make_event("evt-1", "VIS_001")]
+        assert _ingest(client, event).json()["successful"] == 1
+
+        resp = _ingest(client, event)
+        data = resp.json()
         assert data["duplicates"] == 1
         assert data["successful"] == 0
-    
-    def test_ingest_batch_mixed_valid_invalid(self, setup_db):
-        """Test partial success: valid events stored, invalid ones flagged."""
-        payload = {
-            "events": [
-                {
-                    "event_id": "test-event-1",
-                    "store_id": "STORE_BLR_001",
-                    "camera_id": "CAM_1",
-                    "visitor_id": "VIS_001",
-                    "event_type": "ENTRY",
-                    "timestamp": "2026-04-10T16:55:36Z",
-                    "zone_id": None,
-                    "dwell_ms": 0,
-                    "is_staff": False,
-                    "confidence": 0.95,
-                    "metadata": {}
-                },
-                {
-                    "event_id": "test-event-2",
-                    "store_id": "STORE_BLR_001",
-                    "camera_id": "CAM_1",
-                    "visitor_id": "VIS_002",
-                    "event_type": "INVALID_TYPE",  # Invalid event type
-                    "timestamp": "2026-04-10T16:55:37Z",
-                    "zone_id": None,
-                    "dwell_ms": 0,
-                    "is_staff": False,
-                    "confidence": 0.95,
-                    "metadata": {}
-                }
-            ]
-        }
-        
-        response = client.post("/events/ingest", json=payload)
-        data = response.json()
-        assert data["successful"] >= 0  # At least one valid event
-        assert len(data["errors"]) >= 0  # Track failures
 
+    def test_ingest_batch_partial_failure(self, client):
+        """Valid event is stored; invalid event_type is rejected — counts must be exact."""
+        events = [
+            _make_event("evt-1", "VIS_001"),                        # valid
+            {**_make_event("evt-2", "VIS_002"), "event_type": "INVALID_TYPE"},  # invalid
+        ]
+        resp = _ingest(client, events)
+        assert resp.status_code == 200
+        data = resp.json()
+        # Pydantic rejects the invalid event before it reaches the DB layer,
+        # so the whole batch returns 422. If the API accepts it and handles
+        # per-event errors, assert exact counts.
+        assert data["successful"] + data["failed"] + data["duplicates"] == len(events) or resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
 
 class TestMetricsEndpoint:
-    """Test GET /stores/{id}/metrics endpoint."""
-    
-    def test_metrics_empty_store(self, setup_db):
-        """Empty store returns zero metrics gracefully."""
-        response = client.get("/stores/STORE_EMPTY/metrics")
-        assert response.status_code == 200
-        data = response.json()
-        assert data["total_visitors"] == 0
-        assert data["conversion_rate"] is None
-    
-    def test_metrics_with_entries_and_transactions(self, setup_db):
-        """Metrics computed correctly from events."""
-        # Ingest sample events
-        events = [
-            {"event_id": f"event-{i}", "store_id": "STORE_TEST", "camera_id": "CAM_1",
-             "visitor_id": f"VIS_{i}", "event_type": "ENTRY",
-             "timestamp": f"2026-04-10T16:{55+i%5:02d}:36Z",
-             "zone_id": None, "dwell_ms": 0, "is_staff": False, "confidence": 0.95,
-             "metadata": {}}
-            for i in range(10)
-        ]
-        
-        payload = {"events": events}
-        ingest_response = client.post("/events/ingest", json=payload)
-        assert ingest_response.json()["successful"] > 0
-        
-        # Get metrics
-        response = client.get("/stores/STORE_TEST/metrics")
-        assert response.status_code == 200
-        data = response.json()
-        assert data["total_visitors"] >= 0
-        assert data["store_id"] == "STORE_TEST"
-    
-    def test_metrics_exclude_staff(self, setup_db):
-        """Staff events are excluded from visitor count."""
-        events = [
-            {"event_id": "staff-1", "store_id": "STORE_TEST", "camera_id": "CAM_1",
-             "visitor_id": "VIS_STAFF", "event_type": "ENTRY",
-             "timestamp": "2026-04-10T16:55:36Z",
-             "zone_id": None, "dwell_ms": 0, "is_staff": True, "confidence": 0.95,
-             "metadata": {}},
-            {"event_id": "customer-1", "store_id": "STORE_TEST", "camera_id": "CAM_1",
-             "visitor_id": "VIS_001", "event_type": "ENTRY",
-             "timestamp": "2026-04-10T16:55:37Z",
-             "zone_id": None, "dwell_ms": 0, "is_staff": False, "confidence": 0.95,
-             "metadata": {}}
-        ]
-        
-        client.post("/events/ingest", json={"events": events})
-        response = client.get("/stores/STORE_TEST/metrics")
-        data = response.json()
-        # Should count only customer, not staff
-        assert data["total_visitors"] == 1
 
+    def test_metrics_empty_store(self, client):
+        """Empty store returns zero metrics gracefully."""
+        resp = client.get("/stores/STORE_EMPTY/metrics")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["total_visitors"] == 0
+        assert data["unique_visitors"] == 0
+        assert data["conversion_rate"] is None
+
+    def test_metrics_total_vs_unique_visitors(self, client):
+        """total_visitors counts re-entries; unique_visitors deduplicates."""
+        events = [
+            _make_event("evt-1", "VIS_001", timestamp="2026-04-10T10:00:00Z"),
+            _make_event("evt-2", "VIS_001", timestamp="2026-04-10T11:00:00Z"),  # re-entry same visitor
+            _make_event("evt-3", "VIS_002", timestamp="2026-04-10T10:30:00Z"),
+        ]
+        _ingest(client, events)
+        data = client.get("/stores/STORE_TEST/metrics").json()
+        assert data["total_visitors"] == 3    # all three ENTRY events
+        assert data["unique_visitors"] == 2   # VIS_001 and VIS_002
+
+    def test_metrics_exclude_staff(self, client):
+        """Staff events must not be counted in visitor metrics."""
+        events = [
+            _make_event("evt-staff", "VIS_STAFF", is_staff=True),
+            _make_event("evt-cust",  "VIS_001",   is_staff=False),
+        ]
+        _ingest(client, events)
+        data = client.get("/stores/STORE_TEST/metrics").json()
+        assert data["total_visitors"] == 1
+        assert data["unique_visitors"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Funnel
+# ---------------------------------------------------------------------------
 
 class TestFunnelEndpoint:
-    """Test GET /stores/{id}/funnel endpoint."""
-    
-    def test_funnel_structure(self, setup_db):
-        """Funnel has expected structure and stages."""
-        response = client.get("/stores/STORE_TEST/funnel")
-        assert response.status_code == 200
-        data = response.json()
-        
+
+    def test_funnel_structure(self, client):
+        """Funnel has the required four stages with expected fields."""
+        resp = client.get("/stores/STORE_TEST/funnel")
+        assert resp.status_code == 200
+        data = resp.json()
         assert "funnel" in data
-        assert isinstance(data["funnel"], list)
-        assert len(data["funnel"]) >= 3  # At least Entry, Zone, Billing, Purchase
-        
-        # Check stage structure
+        assert len(data["funnel"]) == 4
         for stage in data["funnel"]:
             assert "stage" in stage
             assert "visitor_count" in stage
             assert "drop_off_pct" in stage
-    
-    def test_funnel_drop_off_logic(self, setup_db):
-        """Drop-off percentages increase through funnel."""
-        response = client.get("/stores/STORE_TEST/funnel")
-        data = response.json()
-        funnel = data["funnel"]
-        
-        # Drop-off % should be monotonically non-decreasing
-        for i in range(len(funnel) - 1):
-            assert funnel[i]["drop_off_pct"] <= funnel[i+1]["drop_off_pct"]
 
+    def test_funnel_entry_drop_off_is_zero(self, client):
+        """Entry stage drop-off must always be 0 — it is the top of the funnel."""
+        data = client.get("/stores/STORE_TEST/funnel").json()
+        entry_stage = next(s for s in data["funnel"] if s["stage"] == "Entry")
+        assert entry_stage["drop_off_pct"] == 0.0
+
+    def test_funnel_visitor_counts_decrease(self, client):
+        """Each successive funnel stage must have <= visitors than the prior stage."""
+        _ingest(client, [
+            _make_event("e1", "VIS_001"),
+            _make_event("e2", "VIS_002"),
+        ])
+        data = client.get("/stores/STORE_TEST/funnel").json()
+        counts = [s["visitor_count"] for s in data["funnel"]]
+        for i in range(len(counts) - 1):
+            assert counts[i] >= counts[i + 1], (
+                f"Stage {i} count {counts[i]} < stage {i+1} count {counts[i+1]}"
+            )
+
+    def test_funnel_conversion_rate_matches_stages(self, client):
+        """conversion_rate must equal purchased / entered * 100."""
+        data = client.get("/stores/STORE_TEST/funnel").json()
+        total = data["total_visitors"]
+        converted = data["converted_visitors"]
+        expected_rate = (converted / total * 100) if total > 0 else 0
+        assert abs(data["conversion_rate"] - expected_rate) < 0.01
+
+
+# ---------------------------------------------------------------------------
+# Heatmap
+# ---------------------------------------------------------------------------
 
 class TestHeatmapEndpoint:
-    """Test GET /stores/{id}/heatmap endpoint."""
-    
-    def test_heatmap_empty_store(self, setup_db):
-        """Heatmap gracefully handles store with no zone visits."""
-        response = client.get("/stores/STORE_EMPTY/heatmap")
-        assert response.status_code == 200
-        data = response.json()
-        assert data["zones"] == [] or isinstance(data["zones"], list)
-    
-    def test_heatmap_zone_intensity_normalized(self, setup_db):
-        """Zone intensity values are normalized 0-100."""
-        response = client.get("/stores/STORE_TEST/heatmap")
-        assert response.status_code == 200
-        data = response.json()
-        
-        for zone in data["zones"]:
+
+    def test_heatmap_empty_store(self, client):
+        resp = client.get("/stores/STORE_EMPTY/heatmap")
+        assert resp.status_code == 200
+        assert isinstance(resp.json()["zones"], list)
+
+    def test_heatmap_intensity_normalized_0_to_100(self, client):
+        """Every zone intensity must be in [0, 100]."""
+        _ingest(client, [
+            _make_event("e1", "VIS_001", event_type="ZONE_ENTER", zone_id="ZONE_A"),
+            _make_event("e2", "VIS_002", event_type="ZONE_ENTER", zone_id="ZONE_B"),
+        ])
+        for zone in client.get("/stores/STORE_TEST/heatmap").json()["zones"]:
             assert 0 <= zone["intensity_0_100"] <= 100
 
 
+# ---------------------------------------------------------------------------
+# Anomalies
+# ---------------------------------------------------------------------------
+
 class TestAnomaliesEndpoint:
-    """Test GET /stores/{id}/anomalies endpoint."""
-    
-    def test_anomalies_structure(self, setup_db):
-        """Anomalies endpoint returns expected structure."""
-        response = client.get("/stores/STORE_TEST/anomalies")
-        assert response.status_code == 200
-        data = response.json()
-        
-        assert "anomalies" in data
+
+    def test_anomalies_structure(self, client):
+        resp = client.get("/stores/STORE_TEST/anomalies")
+        assert resp.status_code == 200
+        data = resp.json()
         assert isinstance(data["anomalies"], list)
-        assert "has_critical" in data
         assert isinstance(data["has_critical"], bool)
-    
-    def test_anomalies_severity_values(self, setup_db):
-        """Anomaly severity is one of: INFO, WARN, CRITICAL."""
-        response = client.get("/stores/STORE_TEST/anomalies")
-        data = response.json()
-        
-        for anomaly in data["anomalies"]:
-            assert anomaly["severity"] in ["INFO", "WARN", "CRITICAL"]
+
+    def test_anomaly_severity_values(self, client):
+        """Every anomaly severity must be one of INFO / WARN / CRITICAL."""
+        for anomaly in client.get("/stores/STORE_TEST/anomalies").json()["anomalies"]:
+            assert anomaly["severity"] in {"INFO", "WARN", "CRITICAL"}
             assert "suggested_action" in anomaly
 
 
+# ---------------------------------------------------------------------------
+# Health
+# ---------------------------------------------------------------------------
+
 class TestHealthEndpoint:
-    """Test GET /health endpoint."""
-    
-    def test_health_structure(self, setup_db):
-        """Health endpoint returns required fields."""
-        response = client.get("/health")
-        assert response.status_code == 200
-        data = response.json()
-        
-        assert "status" in data
-        assert data["status"] in ["healthy", "degraded"]
+
+    def test_health_structure(self, client):
+        resp = client.get("/health")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] in {"healthy", "degraded"}
         assert "uptime_seconds" in data
         assert "db_status" in data
         assert "last_event_timestamp" in data
         assert "stale_feeds" in data
-    
-    def test_health_db_connectivity(self, setup_db):
-        """Health checks database connectivity."""
-        response = client.get("/health")
-        data = response.json()
-        assert data["db_status"] in ["connected", "disconnected"]
 
+    def test_health_db_status_values(self, client):
+        data = client.get("/health").json()
+        assert data["db_status"] in {"connected", "disconnected"}
+
+
+# ---------------------------------------------------------------------------
+# Edge cases
+# ---------------------------------------------------------------------------
 
 class TestEdgeCases:
-    """Test edge cases and boundary conditions."""
-    
-    def test_very_large_batch(self, setup_db):
-        """Ingest large batch (500+ events) without error."""
+
+    def test_large_batch(self, client):
+        """500-event batch ingests without error; successful + duplicates == 500."""
         events = [
-            {"event_id": f"event-{i}", "store_id": "STORE_BIG",
-             "camera_id": "CAM_1", "visitor_id": f"VIS_{i%100}",
-             "event_type": "ZONE_DWELL", "timestamp": "2026-04-10T16:55:36Z",
-             "zone_id": "ZONE_A", "dwell_ms": 5000, "is_staff": False,
-             "confidence": 0.90, "metadata": {}}
+            _make_event(f"evt-{i}", f"VIS_{i % 100}",
+                        event_type="ZONE_DWELL", zone_id="ZONE_A", dwell_ms=5000)
             for i in range(500)
         ]
-        
-        response = client.post("/events/ingest", json={"events": events})
-        assert response.status_code == 200
-        data = response.json()
+        resp = _ingest(client, events)
+        assert resp.status_code == 200
+        data = resp.json()
         assert data["successful"] + data["duplicates"] == 500
-    
-    def test_confidence_bounds(self, setup_db):
-        """Confidence values outside [0, 1] are handled."""
-        # Valid confidence in bounds
-        payload = {
-            "events": [{
-                "event_id": "conf-test-1", "store_id": "STORE_TEST",
-                "camera_id": "CAM_1", "visitor_id": "VIS_001",
-                "event_type": "ENTRY", "timestamp": "2026-04-10T16:55:36Z",
-                "zone_id": None, "dwell_ms": 0, "is_staff": False,
-                "confidence": 0.5, "metadata": {}
-            }]
-        }
-        response = client.post("/events/ingest", json=payload)
-        assert response.status_code == 200
+
+    def test_confidence_bounds_accepted(self, client):
+        """Confidence values at the boundary (0.0 and 1.0) are accepted."""
+        for conf, eid in [(0.0, "conf-low"), (1.0, "conf-high")]:
+            payload = [{**_make_event(eid, "VIS_001"), "confidence": conf}]
+            assert _ingest(client, payload).status_code == 200
+
+    def test_confidence_out_of_bounds_rejected(self, client):
+        """Confidence outside [0, 1] must be rejected with 422."""
+        payload = [{**_make_event("conf-bad", "VIS_001"), "confidence": 1.5}]
+        assert _ingest(client, payload).status_code == 422
 
 
 if __name__ == "__main__":

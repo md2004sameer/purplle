@@ -8,15 +8,18 @@ zones, and optional fields.
 CHANGES MADE: Added custom validators for timestamp ISO-8601 format, confidence
 bounds (0-1), and event_id uniqueness guarantees. Enhanced metadata field to
 support extensibility for future event attributes.
+Migrated from Pydantic v1 @validator / class Config to Pydantic v2
+@field_validator / model_config = ConfigDict(...).
 """
 
 from enum import Enum
 from typing import Optional, List, Dict, Any
 from datetime import datetime
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator, model_serializer
+from pydantic import ConfigDict
 import uuid
 
-# Event type enum
+
 class EventType(str, Enum):
     ENTRY = "ENTRY"
     EXIT = "EXIT"
@@ -30,7 +33,9 @@ class EventType(str, Enum):
 
 class StoreEvent(BaseModel):
     """Structured event emitted from detection pipeline."""
-    
+
+    model_config = ConfigDict(use_enum_values=False)
+
     event_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     store_id: str
     camera_id: str
@@ -42,8 +47,9 @@ class StoreEvent(BaseModel):
     is_staff: bool = False
     confidence: float = Field(ge=0.0, le=1.0)
     metadata: Dict[str, Any] = Field(default_factory=dict)
-    
-    @validator('timestamp', pre=True)
+
+    @field_validator('timestamp', mode='before')
+    @classmethod
     def parse_timestamp(cls, v):
         """Ensure timestamp is ISO-8601 UTC."""
         if isinstance(v, str):
@@ -51,24 +57,24 @@ class StoreEvent(BaseModel):
                 return datetime.fromisoformat(v.replace('Z', '+00:00'))
             return datetime.fromisoformat(v)
         return v
-    
-    class Config:
-        use_enum_values = False
-    
-    def dict(self, **kwargs):
-        """Override dict to ensure event_type is string."""
-        d = super().dict(**kwargs)
-        d['timestamp'] = self.timestamp.isoformat() + 'Z' if self.timestamp.tzinfo else self.timestamp.isoformat() + 'Z'
+
+    def model_dump(self, **kwargs):
+        """Override to ensure event_type is a string and timestamp has Z suffix."""
+        d = super().model_dump(**kwargs)
+        d['timestamp'] = (
+            self.timestamp.isoformat() + 'Z'
+            if self.timestamp.tzinfo
+            else self.timestamp.isoformat() + 'Z'
+        )
         d['event_type'] = self.event_type.value
         return d
 
 
 class EventBatch(BaseModel):
     """Batch of events for ingestion."""
-    events: List[StoreEvent]
-    
-    class Config:
-        schema_extra = {
+
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "events": [
                     {
@@ -82,11 +88,14 @@ class EventBatch(BaseModel):
                         "dwell_ms": 0,
                         "is_staff": False,
                         "confidence": 0.95,
-                        "metadata": {}
+                        "metadata": {},
                     }
                 ]
             }
         }
+    )
+
+    events: List[StoreEvent]
 
 
 class IngestResponse(BaseModel):
@@ -170,26 +179,26 @@ class AnomaliesResponse(BaseModel):
 
 class HealthResponse(BaseModel):
     """API health status."""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "status": "healthy",
+                "timestamp": "2026-04-10T16:55:36Z",
+                "last_event_timestamp": {"STORE_BLR_001": "2026-04-10T16:55:35Z"},
+                "stale_feeds": [],
+                "uptime_seconds": 3600.5,
+                "db_status": "connected",
+            }
+        }
+    )
+
     status: str
     timestamp: datetime
     last_event_timestamp: Optional[Dict[str, datetime]] = {}
     stale_feeds: List[str] = []
     uptime_seconds: float
     db_status: str
-    
-    class Config:
-        schema_extra = {
-            "example": {
-                "status": "healthy",
-                "timestamp": "2026-04-10T16:55:36Z",
-                "last_event_timestamp": {
-                    "STORE_BLR_001": "2026-04-10T16:55:35Z"
-                },
-                "stale_feeds": [],
-                "uptime_seconds": 3600.5,
-                "db_status": "connected"
-            }
-        }
 
 
 class ErrorResponse(BaseModel):

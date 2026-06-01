@@ -175,8 +175,17 @@ async def get_metrics(store_id: str, db: Session = Depends(get_db)):
     Handles empty stores gracefully.
     """
     try:
-        # Count unique visitors
-        entry_events = db.query(func.count(func.distinct(Event.visitor_id))).filter(
+        # Count all entry events (includes re-entries) for total_visitors
+        entry_events = db.query(func.count(Event.event_id)).filter(
+            and_(
+                Event.store_id == store_id,
+                Event.event_type == 'ENTRY',
+                Event.is_staff == False
+            )
+        ).scalar() or 0
+
+        # Count distinct visitor_ids for unique_visitors
+        unique_visitor_count = db.query(func.count(func.distinct(Event.visitor_id))).filter(
             and_(
                 Event.store_id == store_id,
                 Event.event_type == 'ENTRY',
@@ -230,7 +239,7 @@ async def get_metrics(store_id: str, db: Session = Depends(get_db)):
             store_id=store_id,
             timestamp=datetime.utcnow(),
             total_visitors=entry_events,
-            unique_visitors=entry_events,
+            unique_visitors=unique_visitor_count,
             conversion_rate=conversion_rate,
             avg_dwell_per_zone=avg_dwell_per_zone,
             current_queue_depth=queue_depth,
@@ -275,12 +284,11 @@ async def get_funnel(store_id: str, db: Session = Depends(get_db)):
             )
         ).scalar() or 0
         
-        # Stage 3: Billing Queue
+        # Stage 3: Billing Queue — only visitors who explicitly joined the queue
         billing_visitors = db.query(func.count(func.distinct(Event.visitor_id))).filter(
             and_(
                 Event.store_id == store_id,
-                Event.event_type.in_(['BILLING_QUEUE_JOIN', 'ZONE_ENTER']),
-                Event.zone_id == 'BILLING',
+                Event.event_type == 'BILLING_QUEUE_JOIN',
                 Event.is_staff == False
             )
         ).scalar() or 0
@@ -399,8 +407,18 @@ async def get_anomalies(store_id: str, db: Session = Depends(get_db)):
     """
     try:
         anomalies = []
-        
-        # Check for queue spike
+
+        # --- Queue spike: compare current hour against previous 24-hour baseline ---
+        # Historical baseline: queue depths from 24h ago up to 1h ago
+        historical_queue_events = db.query(Event.event_metadata).filter(
+            and_(
+                Event.store_id == store_id,
+                Event.event_type == 'BILLING_QUEUE_JOIN',
+                Event.timestamp >= datetime.utcnow() - timedelta(hours=25),
+                Event.timestamp < datetime.utcnow() - timedelta(hours=1),
+            )
+        ).all()
+
         recent_queue_events = db.query(Event.event_metadata).filter(
             and_(
                 Event.store_id == store_id,
@@ -408,25 +426,84 @@ async def get_anomalies(store_id: str, db: Session = Depends(get_db)):
                 Event.timestamp >= datetime.utcnow() - timedelta(minutes=60)
             )
         ).all()
-        
-        if recent_queue_events:
-            queue_depths = [e[0].get('queue_depth', 0) for e in recent_queue_events if e[0]]
-            if queue_depths:
-                current_queue = queue_depths[-1] if queue_depths else 0
-                avg_queue = sum(queue_depths) / len(queue_depths)
-                
-                if current_queue > avg_queue * 1.5:
+
+        if historical_queue_events and recent_queue_events:
+            historical_depths = [e[0].get('queue_depth', 0) for e in historical_queue_events if e[0]]
+            current_depths = [e[0].get('queue_depth', 0) for e in recent_queue_events if e[0]]
+
+            if historical_depths and current_depths:
+                avg_historical = sum(historical_depths) / len(historical_depths)
+                variance = sum((d - avg_historical) ** 2 for d in historical_depths) / len(historical_depths)
+                stddev = variance ** 0.5
+                current_queue = current_depths[-1]
+                threshold = avg_historical + 2 * stddev
+
+                if current_queue > threshold:
                     anomalies.append(Anomaly(
                         anomaly_type="BILLING_QUEUE_SPIKE",
                         severity="WARN",
-                        message=f"Queue depth {current_queue} > 1.5x historical average {avg_queue:.1f}",
+                        message=f"Queue depth {current_queue} exceeds historical avg {avg_historical:.1f} + 2σ ({threshold:.1f})",
                         value=float(current_queue),
-                        threshold=avg_queue * 1.5,
+                        threshold=threshold,
                         suggested_action="Consider opening additional billing counters",
                         detected_at=datetime.utcnow(),
                     ))
+
+        # --- Conversion drop: today's rate vs 7-day rolling average ---
+        today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        week_ago = today_start - timedelta(days=7)
+
+        today_entries = db.query(func.count(func.distinct(Event.visitor_id))).filter(
+            and_(
+                Event.store_id == store_id,
+                Event.event_type == 'ENTRY',
+                Event.is_staff == False,
+                Event.timestamp >= today_start,
+            )
+        ).scalar() or 0
+
+        today_transactions = db.query(func.count(POSTransaction.transaction_id)).filter(
+            and_(
+                POSTransaction.store_id == store_id,
+                POSTransaction.timestamp >= today_start,
+            )
+        ).scalar() or 0
+
+        week_entries = db.query(func.count(func.distinct(Event.visitor_id))).filter(
+            and_(
+                Event.store_id == store_id,
+                Event.event_type == 'ENTRY',
+                Event.is_staff == False,
+                Event.timestamp >= week_ago,
+                Event.timestamp < today_start,
+            )
+        ).scalar() or 0
+
+        week_transactions = db.query(func.count(POSTransaction.transaction_id)).filter(
+            and_(
+                POSTransaction.store_id == store_id,
+                POSTransaction.timestamp >= week_ago,
+                POSTransaction.timestamp < today_start,
+            )
+        ).scalar() or 0
+
+        if today_entries > 0 and week_entries > 0:
+            today_rate = (today_transactions / today_entries) * 100
+            week_rate = (week_transactions / week_entries) * 100
+            drop_threshold = 10.0  # percentage points
+
+            if today_rate < week_rate - drop_threshold:
+                anomalies.append(Anomaly(
+                    anomaly_type="CONVERSION_DROP",
+                    severity="WARN",
+                    message=f"Today's conversion {today_rate:.1f}% is more than {drop_threshold}pp below 7-day avg {week_rate:.1f}%",
+                    value=today_rate,
+                    threshold=week_rate - drop_threshold,
+                    suggested_action="Review today's visitor flow and check for operational issues",
+                    detected_at=datetime.utcnow(),
+                ))
         
-        # Check for dead zone (no visits in last 30 min)
+        # --- Dead zone: no visitor traffic in any known zone for 30 min ---
         recent_zone_events = db.query(Event.zone_id).filter(
             and_(
                 Event.store_id == store_id,
