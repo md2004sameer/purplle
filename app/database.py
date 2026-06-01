@@ -11,9 +11,8 @@ timestamp) for fast range queries, and soft-delete support for data integrity.
 """
 
 from sqlalchemy import create_engine, Column, String, Float, Integer, DateTime, Boolean, ForeignKey, Index, JSON, Text
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, relationship
-from datetime import datetime
+from sqlalchemy.orm import sessionmaker, relationship, DeclarativeBase
+from datetime import datetime, timezone
 import os
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./store_intelligence.db")
@@ -24,7 +23,15 @@ engine = create_engine(
 )
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
+
+
+def utc_now_naive() -> datetime:
+    """UTC timestamp normalized for DateTime columns that store naive values."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+class Base(DeclarativeBase):
+    pass
 
 
 class Store(Base):
@@ -34,7 +41,7 @@ class Store(Base):
     store_id = Column(String, primary_key=True)
     store_name = Column(String, nullable=True)
     city = Column(String, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now_naive)
     
     events = relationship("Event", back_populates="store")
     sessions = relationship("VisitorSession", back_populates="store")
@@ -55,13 +62,14 @@ class Event(Base):
     dwell_ms = Column(Integer, default=0)
     is_staff = Column(Boolean, default=False)
     confidence = Column(Float, nullable=False)
-    event_metadata = Column(JSON, default={})
-    created_at = Column(DateTime, default=datetime.utcnow)
+    event_metadata = Column(JSON, default=dict)
+    created_at = Column(DateTime, default=utc_now_naive)
     
     store = relationship("Store", back_populates="events")
     
     __table_args__ = (
         Index("idx_store_timestamp", "store_id", "timestamp"),
+        Index("idx_event_type_store", "event_type", "store_id"),
         Index("idx_visitor_id", "visitor_id"),
         Index("idx_event_type", "event_type"),
         Index("idx_store_camera", "store_id", "camera_id"),
@@ -79,11 +87,11 @@ class VisitorSession(Base):
     exit_time = Column(DateTime, nullable=True)
     is_staff = Column(Boolean, default=False)
     total_dwell_ms = Column(Integer, default=0)
-    zones_visited = Column(JSON, default=[])
+    zones_visited = Column(JSON, default=list)
     was_in_billing = Column(Boolean, default=False)
     converted = Column(Boolean, default=False)
     transaction_id = Column(String, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now_naive)
     
     store = relationship("Store", back_populates="sessions")
     
@@ -101,9 +109,9 @@ class POSTransaction(Base):
     store_id = Column(String, ForeignKey("stores.store_id"), nullable=False)
     timestamp = Column(DateTime, nullable=False)
     amount = Column(Float, nullable=False)
-    raw_data = Column(JSON, default={})
+    raw_data = Column(JSON, default=dict)
     matched_session_id = Column(String, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now_naive)
     
     store = relationship("Store", back_populates="transactions")
     
@@ -125,7 +133,7 @@ class AnomalyRecord(Base):
     threshold = Column(Float, nullable=True)
     detected_at = Column(DateTime, nullable=False)
     resolved_at = Column(DateTime, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now_naive)
     
     __table_args__ = (
         Index("idx_anomaly_store_time", "store_id", "detected_at"),
@@ -138,7 +146,7 @@ class APIMetadata(Base):
     
     key = Column(String, primary_key=True)
     value = Column(Text, nullable=False)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_at = Column(DateTime, default=utc_now_naive, onupdate=utc_now_naive)
 
 
 def init_db():

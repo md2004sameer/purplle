@@ -1,17 +1,15 @@
-"""
-Tests for API endpoints and business logic.
-
-PROMPT: Asked Claude to generate comprehensive tests for FastAPI endpoints,
-including happy path, edge cases (empty store, stale data), and error handling.
-Requested test structure that covers: event ingestion idempotency, metrics
-consistency, funnel deduplication, anomaly detection logic.
-
-CHANGES MADE: Added custom assertions for funnel drop-off calculation accuracy,
-added tests for re-entry visitor deduplication, added queue depth anomaly
-detection validation, explicit tests for is_staff filtering in all metrics.
-Fixed DB isolation (each test gets its own in-memory SQLite engine),
-fixed funnel drop-off assertion logic, strengthened partial-failure assertions.
-"""
+# PROMPT: Asked Claude to generate comprehensive tests for FastAPI endpoints,
+# including happy path, edge cases (empty store, stale data), and error handling.
+# Requested test structure that covers: event ingestion idempotency, metrics
+# consistency, funnel deduplication, anomaly detection logic, and POS conversion
+# correlation by store plus billing-zone time window.
+#
+# CHANGES MADE: Added custom assertions for funnel drop-off calculation accuracy,
+# added tests for re-entry visitor deduplication, queue depth anomaly detection,
+# is_staff filtering, partial per-event ingestion failures, POS ingestion
+# idempotency, and conversion requiring a billing event in the 5-minute window.
+# Fixed DB isolation (each test gets its own in-memory SQLite engine),
+# fixed funnel drop-off assertion logic, strengthened partial-failure assertions.
 
 import pytest
 from fastapi.testclient import TestClient
@@ -85,6 +83,10 @@ def _ingest(client, events):
     return client.post("/events/ingest", json={"events": events})
 
 
+def _ingest_pos(client, transactions):
+    return client.post("/pos/ingest", json={"transactions": transactions})
+
+
 # ---------------------------------------------------------------------------
 # Event Ingestion
 # ---------------------------------------------------------------------------
@@ -117,15 +119,30 @@ class TestEventIngestion:
             {**_make_event("evt-2", "VIS_002"), "event_type": "INVALID_TYPE"},  # invalid
         ]
         resp = _ingest(client, events)
-        assert resp.status_code in {200, 422}
+        assert resp.status_code == 200
         data = resp.json()
-        # Pydantic rejects the invalid event before it reaches the DB layer,
-        # so the whole batch returns 422. If the API accepts it and handles
-        # per-event errors, assert exact counts.
-        if resp.status_code == 422:
-            assert "detail" in data
-        else:
-            assert data["successful"] + data["failed"] + data["duplicates"] == len(events)
+        assert data["successful"] == 1
+        assert data["failed"] == 1
+        assert data["duplicates"] == 0
+        assert data["errors"][0]["event_id"] == "evt-2"
+
+
+class TestPOSIngestion:
+
+    def test_pos_ingest_idempotent(self, client):
+        transaction = [{
+            "store_id": "STORE_TEST",
+            "transaction_id": "TXN_001",
+            "timestamp": "2026-04-10T16:58:00Z",
+            "basket_value_inr": 1200.0,
+        }]
+        first = _ingest_pos(client, transaction)
+        second = _ingest_pos(client, transaction)
+
+        assert first.status_code == 200
+        assert first.json()["successful"] == 1
+        assert second.status_code == 200
+        assert second.json()["duplicates"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +182,41 @@ class TestMetricsEndpoint:
         data = client.get("/stores/STORE_TEST/metrics").json()
         assert data["total_visitors"] == 1
         assert data["unique_visitors"] == 1
+
+    def test_metrics_conversion_requires_billing_window(self, client):
+        """POS conversion only counts visitors seen in billing within 5 minutes."""
+        _ingest(client, [
+            _make_event("entry-1", "VIS_001", timestamp="2026-04-10T16:50:00Z"),
+            _make_event(
+                "bill-1", "VIS_001", event_type="BILLING_QUEUE_JOIN",
+                zone_id="BILLING", timestamp="2026-04-10T16:56:00Z"
+            ),
+            _make_event("entry-2", "VIS_002", timestamp="2026-04-10T16:51:00Z"),
+        ])
+        _ingest_pos(client, [{
+            "store_id": "STORE_TEST",
+            "transaction_id": "TXN_001",
+            "timestamp": "2026-04-10T16:58:00Z",
+            "basket_value_inr": 999.0,
+        }])
+
+        data = client.get("/stores/STORE_TEST/metrics").json()
+        assert data["transactions_count"] == 1
+        assert data["conversion_rate"] == 50.0
+
+    def test_metrics_transaction_without_billing_does_not_convert(self, client):
+        _ingest(client, [
+            _make_event("entry-1", "VIS_001", timestamp="2026-04-10T16:50:00Z"),
+        ])
+        _ingest_pos(client, [{
+            "store_id": "STORE_TEST",
+            "transaction_id": "TXN_001",
+            "timestamp": "2026-04-10T16:58:00Z",
+            "basket_value_inr": 999.0,
+        }])
+
+        data = client.get("/stores/STORE_TEST/metrics").json()
+        assert data["conversion_rate"] == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +263,26 @@ class TestFunnelEndpoint:
         converted = data["converted_visitors"]
         expected_rate = (converted / total * 100) if total > 0 else 0
         assert abs(data["conversion_rate"] - expected_rate) < 0.01
+
+    def test_funnel_purchase_stage_uses_converted_visitors(self, client):
+        _ingest(client, [
+            _make_event("entry-1", "VIS_001", timestamp="2026-04-10T16:50:00Z"),
+            _make_event(
+                "bill-1", "VIS_001", event_type="BILLING_QUEUE_JOIN",
+                zone_id="BILLING", timestamp="2026-04-10T16:56:00Z"
+            ),
+        ])
+        _ingest_pos(client, [{
+            "store_id": "STORE_TEST",
+            "transaction_id": "TXN_001",
+            "timestamp": "2026-04-10T16:58:00Z",
+            "basket_value_inr": 999.0,
+        }])
+
+        data = client.get("/stores/STORE_TEST/funnel").json()
+        purchase = next(stage for stage in data["funnel"] if stage["stage"] == "Purchase")
+        assert purchase["visitor_count"] == 1
+        assert data["converted_visitors"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -300,9 +372,11 @@ class TestEdgeCases:
             assert _ingest(client, payload).status_code == 200
 
     def test_confidence_out_of_bounds_rejected(self, client):
-        """Confidence outside [0, 1] must be rejected with 422."""
+        """Confidence outside [0, 1] is rejected with HTTP 422."""
         payload = [{**_make_event("conf-bad", "VIS_001"), "confidence": 1.5}]
-        assert _ingest(client, payload).status_code == 422
+        resp = _ingest(client, payload)
+        assert resp.status_code == 422
+        assert "detail" in resp.json()
 
 
 if __name__ == "__main__":

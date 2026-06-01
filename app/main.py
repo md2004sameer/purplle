@@ -24,10 +24,10 @@ from contextlib import asynccontextmanager
 import json
 import uuid
 
-from fastapi import FastAPI, Depends, HTTPException, status, Request, BackgroundTasks
+from fastapi import FastAPI, Depends, HTTPException, status, Request
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
-from sqlalchemy import and_, or_, func
+from sqlalchemy import and_, or_, func, case
 from sqlalchemy.orm import Session
 
 from app.database import init_db, get_db, engine, Store, Event, VisitorSession, POSTransaction, AnomalyRecord, APIMetadata
@@ -48,6 +48,16 @@ logger = logging.getLogger(__name__)
 # Global state
 APP_START_TIME = time.time()
 LAST_EVENT_TIMESTAMP = {}
+DEAD_ZONE_BASELINE_MIN_VISITS = 5
+DEAD_ZONE_RECENT_STORE_MIN_EVENTS = 3
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _utc_now_naive() -> datetime:
+    return _utc_now().replace(tzinfo=None)
 
 
 def _as_naive_utc(value: datetime) -> datetime:
@@ -62,28 +72,61 @@ def _converted_visitors_for_store(db: Session, store_id: str) -> Set[str]:
     A visitor converts when they were in billing in the 5-minute window
     before a transaction timestamp for the same store.
     """
-    converted: Set[str] = set()
-    transactions = db.query(POSTransaction).filter(
-        POSTransaction.store_id == store_id
-    ).all()
+    if db.bind and db.bind.dialect.name == "sqlite":
+        window_start = func.datetime(POSTransaction.timestamp, "-5 minutes")
+    else:
+        window_start = POSTransaction.timestamp - timedelta(minutes=5)
 
-    for transaction in transactions:
-        window_start = transaction.timestamp - timedelta(minutes=5)
-        billing_visitors = db.query(Event.visitor_id).filter(
-            and_(
-                Event.store_id == store_id,
-                Event.is_staff == False,
-                Event.timestamp >= window_start,
-                Event.timestamp <= transaction.timestamp,
-                or_(
-                    Event.zone_id == 'BILLING',
-                    Event.event_type == 'BILLING_QUEUE_JOIN',
+    billing_visitors = db.query(Event.visitor_id).join(
+        POSTransaction,
+        and_(
+            POSTransaction.store_id == Event.store_id,
+            Event.timestamp >= window_start,
+            Event.timestamp <= POSTransaction.timestamp,
+        ),
+    ).filter(
+        and_(
+            Event.store_id == store_id,
+            Event.is_staff == False,
+            or_(
+                Event.zone_id == 'BILLING',
+                Event.event_type == 'BILLING_QUEUE_JOIN',
+            ),
+        )
+    ).distinct().all()
+
+    return {visitor_id for (visitor_id,) in billing_visitors}
+
+
+def _data_quality_score(db: Session, store_id: str) -> float:
+    """Score ingested data using event confidence and required-field completeness."""
+    total_events = db.query(func.count(Event.event_id)).filter(
+        Event.store_id == store_id
+    ).scalar() or 0
+    if total_events == 0:
+        return 0.0
+
+    avg_confidence = db.query(func.avg(Event.confidence)).filter(
+        Event.store_id == store_id
+    ).scalar() or 0.0
+    complete_events = db.query(
+        func.sum(
+            case(
+                (
+                    and_(
+                        Event.camera_id != None,
+                        Event.visitor_id != None,
+                        Event.event_type != None,
+                        Event.timestamp != None,
+                    ),
+                    1,
                 ),
+                else_=0,
             )
-        ).distinct().all()
-        converted.update(visitor_id for (visitor_id,) in billing_visitors)
-
-    return converted
+        )
+    ).filter(Event.store_id == store_id).scalar() or 0
+    completeness = complete_events / total_events
+    return round(float(avg_confidence) * completeness, 3)
 
 
 def _queue_abandonment_rate(db: Session, store_id: str) -> Optional[float]:
@@ -151,7 +194,6 @@ async def log_requests(request: Request, call_next):
 async def ingest_events(
     request: Request,
     db: Session = Depends(get_db),
-    background_tasks: BackgroundTasks = None
 ):
     """
     Ingest batch of events from detection pipeline.
@@ -183,6 +225,9 @@ async def ingest_events(
                     "event_id": raw_event.get("event_id") if isinstance(raw_event, dict) else None,
                     "error": e.errors(),
                 })
+
+        if failed and not validated_events:
+            raise HTTPException(status_code=422, detail=errors)
 
         # Ensure stores exist
         store_ids = set(e.store_id for e in validated_events)
@@ -336,13 +381,13 @@ async def get_metrics(store_id: str, db: Session = Depends(get_db)):
             )
         ).scalar() or 0
         
-        # Count transactions
-        transactions = db.query(POSTransaction).filter(
+        # Aggregate POS totals in the database instead of loading all rows.
+        transaction_count, total_sales = db.query(
+            func.count(POSTransaction.transaction_id),
+            func.coalesce(func.sum(POSTransaction.amount), 0.0),
+        ).filter(
             POSTransaction.store_id == store_id
-        ).all()
-        
-        transaction_count = len(transactions)
-        total_sales = sum(t.amount for t in transactions)
+        ).one()
         converted_visitors = _converted_visitors_for_store(db, store_id)
         
         # Compute conversion rate
@@ -381,7 +426,7 @@ async def get_metrics(store_id: str, db: Session = Depends(get_db)):
         
         return MetricsResponse(
             store_id=store_id,
-            timestamp=datetime.utcnow(),
+            timestamp=_utc_now(),
             total_visitors=entry_events,
             unique_visitors=unique_visitor_count,
             conversion_rate=conversion_rate,
@@ -390,7 +435,7 @@ async def get_metrics(store_id: str, db: Session = Depends(get_db)):
             queue_abandonment_rate=_queue_abandonment_rate(db, store_id),
             transactions_count=transaction_count,
             total_sales=total_sales,
-            data_quality_score=0.85,
+            data_quality_score=_data_quality_score(db, store_id),
         )
     
     except Exception as e:
@@ -473,7 +518,7 @@ async def get_funnel(store_id: str, db: Session = Depends(get_db)):
         
         return FunnelResponse(
             store_id=store_id,
-            timestamp=datetime.utcnow(),
+            timestamp=_utc_now(),
             funnel=funnel_stages,
             total_visitors=entries,
             converted_visitors=converted_count,
@@ -529,7 +574,7 @@ async def get_heatmap(store_id: str, db: Session = Depends(get_db)):
         
         return HeatmapResponse(
             store_id=store_id,
-            timestamp=datetime.utcnow(),
+            timestamp=_utc_now(),
             zones=zone_stats,
             data_confidence=overall_confidence,
         )
@@ -550,6 +595,7 @@ async def get_anomalies(store_id: str, db: Session = Depends(get_db)):
     """
     try:
         anomalies = []
+        now = _utc_now_naive()
 
         # --- Queue spike: compare current hour against previous 24-hour baseline ---
         # Historical baseline: queue depths from 24h ago up to 1h ago
@@ -557,8 +603,8 @@ async def get_anomalies(store_id: str, db: Session = Depends(get_db)):
             and_(
                 Event.store_id == store_id,
                 Event.event_type == 'BILLING_QUEUE_JOIN',
-                Event.timestamp >= datetime.utcnow() - timedelta(hours=25),
-                Event.timestamp < datetime.utcnow() - timedelta(hours=1),
+                Event.timestamp >= now - timedelta(hours=25),
+                Event.timestamp < now - timedelta(hours=1),
             )
         ).all()
 
@@ -566,7 +612,7 @@ async def get_anomalies(store_id: str, db: Session = Depends(get_db)):
             and_(
                 Event.store_id == store_id,
                 Event.event_type == 'BILLING_QUEUE_JOIN',
-                Event.timestamp >= datetime.utcnow() - timedelta(minutes=60)
+                Event.timestamp >= now - timedelta(minutes=60)
             )
         ).all()
 
@@ -589,11 +635,11 @@ async def get_anomalies(store_id: str, db: Session = Depends(get_db)):
                         value=float(current_queue),
                         threshold=threshold,
                         suggested_action="Consider opening additional billing counters",
-                        detected_at=datetime.utcnow(),
+                        detected_at=_utc_now(),
                     ))
 
         # --- Conversion drop: today's rate vs 7-day rolling average ---
-        today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         week_ago = today_start - timedelta(days=7)
 
         today_entries = db.query(func.count(func.distinct(Event.visitor_id))).filter(
@@ -643,39 +689,57 @@ async def get_anomalies(store_id: str, db: Session = Depends(get_db)):
                     value=today_rate,
                     threshold=week_rate - drop_threshold,
                     suggested_action="Review today's visitor flow and check for operational issues",
-                    detected_at=datetime.utcnow(),
+                    detected_at=_utc_now(),
                 ))
         
-        # --- Dead zone: no visitor traffic in any known zone for 30 min ---
+        # --- Dead zone: known active zones with no recent traffic while the store is active ---
+        recent_store_events = db.query(func.count(Event.event_id)).filter(
+            and_(
+                Event.store_id == store_id,
+                Event.timestamp >= now - timedelta(minutes=30),
+                Event.is_staff == False,
+            )
+        ).scalar() or 0
+
         recent_zone_events = db.query(Event.zone_id).filter(
             and_(
                 Event.store_id == store_id,
-                Event.timestamp >= datetime.utcnow() - timedelta(minutes=30),
+                Event.timestamp >= now - timedelta(minutes=30),
                 Event.is_staff == False
             )
         ).all()
         
         visited_zones = set(z[0] for z in recent_zone_events if z[0])
-        all_zones = db.query(func.distinct(Event.zone_id)).filter(
-            Event.store_id == store_id
+        all_zones = db.query(Event.zone_id).filter(
+            and_(
+                Event.store_id == store_id,
+                Event.is_staff == False,
+                Event.zone_id != None,
+            )
+        ).group_by(Event.zone_id).having(
+            func.count(Event.event_id) >= DEAD_ZONE_BASELINE_MIN_VISITS
         ).all()
         all_zone_ids = set(z[0] for z in all_zones if z[0])
         
-        dead_zones = all_zone_ids - visited_zones
+        dead_zones = (
+            all_zone_ids - visited_zones
+            if recent_store_events >= DEAD_ZONE_RECENT_STORE_MIN_EVENTS
+            else set()
+        )
         if dead_zones:
             anomalies.append(Anomaly(
                 anomaly_type="DEAD_ZONE",
                 severity="INFO",
                 message=f"No visitors in zones: {', '.join(dead_zones)}",
                 suggested_action="Verify zone definitions and camera coverage",
-                detected_at=datetime.utcnow(),
+                detected_at=_utc_now(),
             ))
         
         has_critical = any(a.severity == "CRITICAL" for a in anomalies)
         
         return AnomaliesResponse(
             store_id=store_id,
-            timestamp=datetime.utcnow(),
+            timestamp=_utc_now(),
             anomalies=anomalies,
             has_critical=has_critical,
         )
@@ -684,7 +748,7 @@ async def get_anomalies(store_id: str, db: Session = Depends(get_db)):
         logger.error(f"Anomaly detection error: {str(e)}")
         return AnomaliesResponse(
             store_id=store_id,
-            timestamp=datetime.utcnow(),
+            timestamp=_utc_now(),
             anomalies=[],
             has_critical=False,
         )
@@ -724,13 +788,13 @@ async def health_check(db: Session = Depends(get_db)):
             
             # Check if stale (>10 min). Event timestamps parsed from ISO-8601
             # may be timezone-aware, while legacy/generated values can be naive.
-            now = datetime.now(ts.tzinfo) if ts.tzinfo else datetime.utcnow()
+            now = datetime.now(ts.tzinfo) if ts.tzinfo else _utc_now_naive()
             if now - ts > timedelta(minutes=10):
                 stale_feeds.append(store_id)
         
         return HealthResponse(
             status="healthy" if db_status == "connected" else "degraded",
-            timestamp=datetime.utcnow(),
+            timestamp=_utc_now(),
             last_event_timestamp=last_event_per_store,
             stale_feeds=stale_feeds,
             uptime_seconds=uptime,
@@ -754,7 +818,7 @@ async def http_exception_handler(request: Request, exc: HTTPException):
         content={
             "error": exc.detail,
             "detail": exc.detail,
-            "timestamp": datetime.utcnow().isoformat() + 'Z',
+            "timestamp": _utc_now().isoformat().replace('+00:00', 'Z'),
             "trace_id": request.headers.get("X-Trace-ID", "unknown"),
         }
     )

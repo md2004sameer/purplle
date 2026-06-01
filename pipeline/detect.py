@@ -16,7 +16,7 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 from collections import defaultdict, deque
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
 import uuid
 from typing import List, Dict, Optional, Tuple
@@ -113,16 +113,17 @@ class PersonTracker:
         self.max_age = max_age  # frames
         self.track_history = defaultdict(lambda: deque(maxlen=50))
     
-    def update(self, detections: np.ndarray, frame_idx: int) -> Dict[int, Dict]:
+    def update(self, detections: np.ndarray, frame_idx: int, confidences: np.ndarray = None) -> Dict[int, Dict]:
         """
         Update tracks with new detections.
         
         Args:
             detections: Nx4 array of [x1, y1, x2, y2] bboxes
             frame_idx: Current frame index
+            confidences: N-length array of detection confidences (optional)
         
         Returns:
-            Dict mapping track_id -> bbox and metadata
+            Dict mapping track_id -> bbox and metadata (includes 'det_idx' for confidence lookup)
         """
         updated_tracks = {}
         
@@ -134,8 +135,9 @@ class PersonTracker:
                 del self.tracks[tid]
             return updated_tracks
         
-        # Simple IoU-based association
-        for det_bbox in detections:
+        # Simple IoU-based association — track which detection each track was matched to
+        matched_detections = set()
+        for det_idx, det_bbox in enumerate(detections):
             matched = False
             best_iou = 0.3
             best_id = None
@@ -150,9 +152,13 @@ class PersonTracker:
             if best_id is not None:
                 self.tracks[best_id]['bbox'] = det_bbox
                 self.tracks[best_id]['last_seen'] = frame_idx
+                self.tracks[best_id]['det_idx'] = det_idx  # Store detection index
+                if confidences is not None and det_idx < len(confidences):
+                    self.tracks[best_id]['confidence'] = float(confidences[det_idx])
                 self.track_history[best_id].append(det_bbox)
                 updated_tracks[best_id] = self.tracks[best_id]
                 matched = True
+                matched_detections.add(det_idx)
             
             if not matched and len(self.tracks) < self.max_tracks:
                 new_id = self.next_id
@@ -162,12 +168,14 @@ class PersonTracker:
                     'first_seen': frame_idx,
                     'last_seen': frame_idx,
                     'track_id': new_id,
+                    'det_idx': det_idx,  # Store detection index for new track
                     'visitor_token': f"VIS_{uuid.uuid4().hex[:6]}",
                     'zone_history': [],
-                    'confidence': 0.95,
+                    'confidence': float(confidences[det_idx]) if confidences is not None and det_idx < len(confidences) else 0.95,
                 }
                 self.track_history[new_id].append(det_bbox)
                 updated_tracks[new_id] = self.tracks[new_id]
+                matched_detections.add(det_idx)
         
         return updated_tracks
     
@@ -389,7 +397,7 @@ class DetectionPipeline:
         self.tracker = PersonTracker()
     
     def process_clip(self, video_path: str, store_id: str, camera_id: str,
-                    zones: Dict[str, Dict]) -> List[Dict]:
+                    zones: Dict[str, Dict], recording_start: datetime = None) -> List[Dict]:
         """
         Process a CCTV clip and emit events.
         
@@ -398,6 +406,7 @@ class DetectionPipeline:
             store_id: Store identifier
             camera_id: Camera identifier
             zones: Zone definitions
+            recording_start: When the video recording started (UTC). If None, uses current time.
         
         Returns:
             List of structured events
@@ -405,6 +414,10 @@ class DetectionPipeline:
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             raise ValueError(f"Cannot open video: {video_path}")
+        
+        # Default to current time if recording_start not provided
+        if recording_start is None:
+            recording_start = datetime.now(timezone.utc)
         
         fps = cap.get(cv2.CAP_PROP_FPS)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -444,20 +457,19 @@ class DetectionPipeline:
                 detections = np.array([])
                 confidences = np.array([])
 
-            # Update tracks — returns dict of track_id -> track_data in the same
-            # order detections were matched, so index i in tracks corresponds to
-            # confidences[i] for newly-matched detections.
-            tracks = self.tracker.update(detections, frame_idx)
+            # Update tracks with detection confidences
+            # The tracker now stores the correct detection index and confidence for each track
+            tracks = self.tracker.update(detections, frame_idx, confidences)
 
-            timestamp = datetime.utcnow() + timedelta(seconds=frame_idx / fps)
+            timestamp = recording_start + timedelta(seconds=frame_idx / fps)
 
             active_visitor_ids: set = set()
-            for det_idx, (track_id, track_data) in enumerate(tracks.items()):
+            for track_id, track_data in tracks.items():
                 visitor_id = track_data['visitor_token']
                 bbox = track_data['bbox']
 
-                # Per-detection confidence — avoid always using confidences[0]
-                conf = float(confidences[det_idx]) if det_idx < len(confidences) else 0.9
+                # Use confidence stored in track_data (set by tracker during update)
+                conf = track_data.get('confidence', 0.9)
 
                 active_visitor_ids.add(visitor_id)
 
@@ -513,9 +525,10 @@ class DetectionPipeline:
                         visitor_states[visitor_id]['last_dwell_emit'][zone_id] = timestamp
 
                         if zone_id == 'BILLING':
+                            # Count active visitors now in BILLING zone (including current visitor)
                             billing_active = sum(
                                 1 for active_id in active_visitor_ids
-                                if visitor_zones[active_id]['current'] == 'BILLING'
+                                if visitor_zones[active_id]['current'] == 'BILLING' or active_id == visitor_id
                             )
                             if billing_active > 0 and visitor_id not in queue_members:
                                 queue_evt = emitter.emit_queue_event(
@@ -544,7 +557,7 @@ class DetectionPipeline:
             for visitor_id, state in list(visitor_states.items()):
                 if (visitor_id not in active_visitor_ids and
                         frame_idx - state['last_frame'] > exit_gap_frames):
-                    exit_ts = datetime.utcnow() + timedelta(
+                    exit_ts = datetime.now(timezone.utc) + timedelta(
                         seconds=state['last_frame'] / fps
                     )
                     evt = emitter.emit_exit_event(visitor_id, exit_ts)
@@ -556,7 +569,7 @@ class DetectionPipeline:
             frame_idx += 1
 
         # --- EXIT: flush any visitors still tracked at end of clip ---
-        end_timestamp = datetime.utcnow() + timedelta(seconds=frame_idx / fps)
+        end_timestamp = recording_start + timedelta(seconds=frame_idx / fps)
         for visitor_id, state in visitor_states.items():
             evt = emitter.emit_exit_event(visitor_id, end_timestamp)
             evt['is_staff'] = state['is_staff']

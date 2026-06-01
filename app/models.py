@@ -14,10 +14,14 @@ Migrated from Pydantic v1 @validator / class Config to Pydantic v2
 
 from enum import Enum
 from typing import Optional, List, Dict, Any
-from datetime import datetime
+from datetime import datetime, timezone
 from pydantic import BaseModel, Field, field_validator, model_serializer
 from pydantic import ConfigDict
 import uuid
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 class EventType(str, Enum):
@@ -58,16 +62,18 @@ class StoreEvent(BaseModel):
             return datetime.fromisoformat(v)
         return v
 
-    def model_dump(self, **kwargs):
-        """Override to ensure event_type is a string and timestamp has Z suffix."""
-        d = super().model_dump(**kwargs)
-        d['timestamp'] = (
-            self.timestamp.isoformat() + 'Z'
-            if self.timestamp.tzinfo
-            else self.timestamp.isoformat() + 'Z'
-        )
-        d['event_type'] = self.event_type.value
-        return d
+    @model_serializer(mode='wrap')
+    def serialize_model(self, handler):
+        """Serialize event_type and timestamp consistently without overriding model_dump."""
+        data = handler(self)
+        timestamp = self.timestamp
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        else:
+            timestamp = timestamp.astimezone(timezone.utc)
+        data['timestamp'] = timestamp.isoformat().replace('+00:00', 'Z')
+        data['event_type'] = self.event_type.value
+        return data
 
 
 class EventBatch(BaseModel):
@@ -95,7 +101,41 @@ class EventBatch(BaseModel):
         }
     )
 
-    events: List[StoreEvent]
+    events: List[StoreEvent] = Field(max_length=1000)
+
+
+class POSTransactionIn(BaseModel):
+    """POS transaction record used for conversion correlation."""
+
+    store_id: str
+    transaction_id: str
+    timestamp: datetime
+    basket_value_inr: float = Field(ge=0.0)
+
+    @field_validator('timestamp', mode='before')
+    @classmethod
+    def parse_timestamp(cls, v):
+        if isinstance(v, str):
+            if v.endswith('Z'):
+                return datetime.fromisoformat(v.replace('Z', '+00:00'))
+            return datetime.fromisoformat(v)
+        return v
+
+
+class POSTransactionBatch(BaseModel):
+    """Batch of POS transactions."""
+
+    transactions: List[POSTransactionIn] = Field(max_length=1000)
+
+
+class POSIngestResponse(BaseModel):
+    """Response from POS transaction ingestion."""
+
+    successful: int
+    failed: int
+    duplicates: int
+    errors: List[Dict[str, Any]] = Field(default_factory=list)
+    timestamp: datetime = Field(default_factory=utc_now)
 
 
 class IngestResponse(BaseModel):
@@ -103,8 +143,8 @@ class IngestResponse(BaseModel):
     successful: int
     failed: int
     duplicates: int
-    errors: List[Dict[str, Any]] = []
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    errors: List[Dict[str, Any]] = Field(default_factory=list)
+    timestamp: datetime = Field(default_factory=utc_now)
 
 
 class MetricsResponse(BaseModel):
@@ -114,7 +154,7 @@ class MetricsResponse(BaseModel):
     total_visitors: int
     unique_visitors: int
     conversion_rate: Optional[float] = None
-    avg_dwell_per_zone: Dict[str, float] = {}
+    avg_dwell_per_zone: Dict[str, float] = Field(default_factory=dict)
     current_queue_depth: Optional[int] = None
     queue_abandonment_rate: Optional[float] = None
     transactions_count: int = 0
@@ -195,8 +235,8 @@ class HealthResponse(BaseModel):
 
     status: str
     timestamp: datetime
-    last_event_timestamp: Optional[Dict[str, datetime]] = {}
-    stale_feeds: List[str] = []
+    last_event_timestamp: Optional[Dict[str, datetime]] = Field(default_factory=dict)
+    stale_feeds: List[str] = Field(default_factory=list)
     uptime_seconds: float
     db_status: str
 
@@ -205,5 +245,5 @@ class ErrorResponse(BaseModel):
     """Standardized error response."""
     error: str
     detail: str
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=utc_now)
     trace_id: Optional[str] = None
