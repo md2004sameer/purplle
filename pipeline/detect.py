@@ -364,52 +364,115 @@ class DetectionPipeline:
         
         frame_idx = 0
         visitor_zones = defaultdict(lambda: {'current': None, 'dwell_start': None})
-        visitor_states = {}  # Track visitor state for entry/exit
-        
+        # visitor_states: visitor_id -> {'last_frame': int, 'zone_history': List[str], 'is_staff': bool}
+        # Tracks first/last appearance so we can emit ENTRY and EXIT correctly.
+        visitor_states: Dict[str, Dict] = {}
+
+        # How many frames of absence before we declare a visitor has exited.
+        # 2 seconds of gap handles momentary occlusion without false exits.
+        exit_gap_frames = max(1, int(fps * 2))
+
         logger.info(f"Processing {video_path}: {total_frames} frames @ {fps}fps")
-        
+
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 break
-            
+
             # Run detection
             results = self.model(frame, conf=0.5, classes=[0])  # class 0 = person
-            
+
             if len(results) > 0 and len(results[0].boxes) > 0:
                 detections = results[0].boxes.xyxy.cpu().numpy()
                 confidences = results[0].boxes.conf.cpu().numpy()
             else:
                 detections = np.array([])
                 confidences = np.array([])
-            
-            # Update tracks
+
+            # Update tracks — returns dict of track_id -> track_data in the same
+            # order detections were matched, so index i in tracks corresponds to
+            # confidences[i] for newly-matched detections.
             tracks = self.tracker.update(detections, frame_idx)
-            
-            # Generate events
+
             timestamp = datetime.utcnow() + timedelta(seconds=frame_idx / fps)
-            
-            for track_id, track_data in tracks.items():
+
+            active_visitor_ids: set = set()
+            for det_idx, (track_id, track_data) in enumerate(tracks.items()):
                 visitor_id = track_data['visitor_token']
                 bbox = track_data['bbox']
-                conf = confidences[0] if len(confidences) > 0 else 0.9
-                
+
+                # Per-detection confidence — avoid always using confidences[0]
+                conf = float(confidences[det_idx]) if det_idx < len(confidences) else 0.9
+
+                active_visitor_ids.add(visitor_id)
+
+                # --- ENTRY: emit once on first appearance ---
+                if visitor_id not in visitor_states:
+                    visitor_states[visitor_id] = {
+                        'last_frame': frame_idx,
+                        'zone_history': [],
+                        'is_staff': False,
+                    }
+                    emitter.emit_entry_event(visitor_id, timestamp)
+                else:
+                    visitor_states[visitor_id]['last_frame'] = frame_idx
+
                 # Classify zone
                 zone_id = zone_classifier.classify(bbox)
-                
+
+                # Update zone history for staff detection
+                if zone_id:
+                    visitor_states[visitor_id]['zone_history'].append(zone_id)
+
+                # Re-evaluate staff status each frame using accumulated zone history
+                is_staff = staff_detector.is_staff(
+                    visitor_id,
+                    zone_id,
+                    visitor_states[visitor_id]['zone_history'],
+                )
+                visitor_states[visitor_id]['is_staff'] = is_staff
+
                 # Track zone transitions
                 prev_zone = visitor_zones[visitor_id]['current']
                 if zone_id != prev_zone:
                     if prev_zone is not None:
-                        dwell_ms = int((timestamp - visitor_zones[visitor_id]['dwell_start']).total_seconds() * 1000)
-                        emitter.emit_zone_event(visitor_id, prev_zone, 'ZONE_EXIT', timestamp, dwell_ms, conf)
-                    
+                        dwell_ms = int(
+                            (timestamp - visitor_zones[visitor_id]['dwell_start'])
+                            .total_seconds() * 1000
+                        )
+                        evt = emitter.emit_zone_event(
+                            visitor_id, prev_zone, 'ZONE_EXIT', timestamp, dwell_ms, conf
+                        )
+                        evt['is_staff'] = is_staff
+
                     if zone_id is not None:
-                        emitter.emit_zone_event(visitor_id, zone_id, 'ZONE_ENTER', timestamp, 0, conf)
+                        evt = emitter.emit_zone_event(
+                            visitor_id, zone_id, 'ZONE_ENTER', timestamp, 0, conf
+                        )
+                        evt['is_staff'] = is_staff
                         visitor_zones[visitor_id]['dwell_start'] = timestamp
-                    
+
                     visitor_zones[visitor_id]['current'] = zone_id
-        
+
+            # --- EXIT: emit for visitors absent long enough to be considered gone ---
+            for visitor_id, state in list(visitor_states.items()):
+                if (visitor_id not in active_visitor_ids and
+                        frame_idx - state['last_frame'] > exit_gap_frames):
+                    exit_ts = datetime.utcnow() + timedelta(
+                        seconds=state['last_frame'] / fps
+                    )
+                    evt = emitter.emit_exit_event(visitor_id, exit_ts)
+                    evt['is_staff'] = state['is_staff']
+                    del visitor_states[visitor_id]
+
+            frame_idx += 1
+
+        # --- EXIT: flush any visitors still tracked at end of clip ---
+        end_timestamp = datetime.utcnow() + timedelta(seconds=frame_idx / fps)
+        for visitor_id, state in visitor_states.items():
+            evt = emitter.emit_exit_event(visitor_id, end_timestamp)
+            evt['is_staff'] = state['is_staff']
+
         cap.release()
         
         logger.info(f"Emitted {len(emitter.events)} events from {video_path}")
@@ -428,7 +491,7 @@ def process_all_clips(data_dir: str, store_id: str, store_layout_path: str = Non
     Returns:
         Combined list of events from all cameras
     """
-      # Auto-detect store_layout.json if not provided
+    # Auto-detect store_layout.json if not provided
     if store_layout_path is None:
         store_layout_path = os.path.join(os.path.dirname(data_dir), 'store_layout.json')
     
