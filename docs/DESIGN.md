@@ -6,6 +6,21 @@
 
 ---
 
+## 📦 Purplle Resources Integration
+
+**All Purplle team resources are integrated into this system:**
+
+| Resource | File(s) | Role |
+|----------|---------|------|
+| CCTV Footage | `/data/CCTV Footage/CAM {1-5}.mp4` | Input to detection pipeline (YOLOv8 + ByteTrack) |
+| Store Layout | `/data/Brigade Road - Store layoutc5f5d56.xlsx` → `/data/store_layout.json` | Zone definitions, bounding boxes, camera calibration |
+| POS Transactions | `/data/Brigade_Bangalore_10_April_26 (1)bc6219c.csv` | Ground truth for conversion metrics validation |
+| Assessment Framework | `/data/Assessment Evaluation Frameworkb24a398.pdf` | Success criteria: detection recall ≥90%, precision ≥85%, conversion ±5% |
+
+**📖 Detailed resource documentation:** See [docs/RESOURCES.md](../docs/RESOURCES.md)
+
+---
+
 ## 1. System Overview
 
 The Store Intelligence API transforms raw CCTV footage into actionable business metrics through a three-stage pipeline:
@@ -235,8 +250,8 @@ This section documents where AI (Claude 3.5 Sonnet) shaped architectural and imp
 
 **Solution:**
 - Each camera processes independently, assigns separate visitor_id
-- Post-processing step (not yet implemented) would use appearance-based re-ID to deduplicate
-- Current approach accepts slight inflation; can be addressed in v2 with person re-identification
+- Visitor tokens persist within a clip via IoU-based tracking
+- Full cross-camera appearance re-ID is still a known limitation; adding OSNet/torchreid embeddings is the next production step
 
 ### 5.6 Empty Store Periods
 
@@ -244,7 +259,7 @@ This section documents where AI (Claude 3.5 Sonnet) shaped architectural and imp
 
 **Solution:**
 - All aggregate queries use `COALESCE(COUNT(...), 0)` to return 0 instead of null
-- Division-by-zero guards: `conversion_rate = (transactions / entries * 100) if entries > 0 else None`
+- Division-by-zero guards: `conversion_rate = (converted_visitors / unique_visitors * 100) if unique_visitors > 0 else None`
 - Heatmap and anomaly endpoints handle empty zone lists gracefully
 
 ---
@@ -269,9 +284,7 @@ trace_id=550e8400-e29b-41d4-a716-446655440000 method=POST path=/events/ingest st
 ### 6.3 Testing
 
 **Test Coverage:**
-- `test_models.py`: Event schema validation
-- `test_api.py`: Endpoint correctness, edge cases (empty store, all-staff clip)
-- `test_pipeline.py`: Detection pipeline on sample frame
+- `test_api.py`: Endpoint correctness, event schema validation, POS conversion correlation, idempotency, and edge cases
 
 **Acceptance Criteria:**
 - ✓ `docker compose up` runs without manual steps
@@ -286,7 +299,7 @@ trace_id=550e8400-e29b-41d4-a716-446655440000 method=POST path=/events/ingest st
 
 1. **Camera Overlap Deduplication:** Current approach allows slight visitor count inflation if same person visible in multiple cameras simultaneously.
 2. **Staff Detection:** Heuristic-based; may misclassify repeat customers as staff.
-3. **Zone Definitions:** Hardcoded in code; should be imported from store_layout.json in production.
+3. **Zone Definitions:** Imported from `store_layout.json`; accuracy still depends on calibrated per-camera zone boxes.
 4. **Batch Processing:** Current pipeline processes clips offline; future work is streaming from live camera feeds.
 5. **POS Correlation:** Uses time window + store_id; no customer ID linking means some conversions may be unmatched.
 

@@ -65,40 +65,29 @@ Create `data/store_layout.json`:
 {
   "store_id": "STORE_BLR_001",
   "store_name": "Brigade Bangalore",
-  "zones": {
-    "ENTRY": {
-      "x_min": 0,
-      "y_min": 0,
-      "x_max": 400,
-      "y_max": 1080,
-      "name": "Entry/Exit Threshold"
+  "zones": [
+    {
+      "zone_id": "ENTRY",
+      "zone_name": "Entry/Exit Threshold",
+      "bbox": {"x_min": 0, "y_min": 0, "x_max": 400, "y_max": 1080}
     },
-    "SKINCARE": {
-      "x_min": 400,
-      "y_min": 200,
-      "x_max": 800,
-      "y_max": 600,
-      "name": "Skincare Zone"
+    {
+      "zone_id": "SKINCARE",
+      "zone_name": "Skincare Zone",
+      "bbox": {"x_min": 400, "y_min": 200, "x_max": 800, "y_max": 600}
     },
-    "MAKEUP": {
-      "x_min": 800,
-      "y_min": 200,
-      "x_max": 1400,
-      "y_max": 600,
-      "name": "Makeup Zone"
+    {
+      "zone_id": "MAKEUP",
+      "zone_name": "Makeup Zone",
+      "bbox": {"x_min": 800, "y_min": 200, "x_max": 1400, "y_max": 600}
     },
-    "BILLING": {
-      "x_min": 1400,
-      "y_min": 600,
-      "x_max": 1920,
-      "y_max": 1080,
-      "name": "Billing Counter"
+    {
+      "zone_id": "BILLING",
+      "zone_name": "Billing Counter",
+      "bbox": {"x_min": 1400, "y_min": 600, "x_max": 1920, "y_max": 1080}
     }
-  },
-  "open_hours": {
-    "start": "10:00",
-    "end": "21:00"
-  }
+  ],
+  "open_hours": {"start": "10:00", "end": "21:00"}
 }
 ```
 
@@ -135,6 +124,26 @@ python pipeline/ingest.py \
 # Batch 1: 500 events → 200ms → { "successful": 500, "failed": 0, "duplicates": 0 }
 # Batch 2: 400 events → 180ms → { "successful": 400, "failed": 0, "duplicates": 0 }
 # Total: 900 events ingested in 2 batches
+```
+
+### Step 5: Load POS Transactions
+
+```bash
+python pipeline/load_pos.py \
+  --csv_file data/pos_transactions.csv \
+  --api_url http://localhost:8000 \
+  --batch_size 500
+```
+
+The API computes conversion by matching POS transactions to non-staff visitors
+seen in the billing zone during the 5-minute window before the transaction.
+
+### Optional: Live Terminal Dashboard
+
+```bash
+python dashboard/live_dashboard.py \
+  --api_url http://localhost:8000 \
+  --store_id STORE_BLR_001
 ```
 
 ---
@@ -366,16 +375,15 @@ store-intelligence/
 │   ├── __init__.py
 │   ├── main.py                 # FastAPI application (all endpoints)
 │   ├── models.py               # Pydantic schemas (events, metrics, responses)
-│   ├── database.py             # SQLAlchemy ORM + DB setup
-│   └── ingest.py               # Event ingestion utility
+│   └── database.py             # SQLAlchemy ORM + DB setup
 ├── pipeline/
 │   ├── detect.py               # CCTV processing + event emission
 │   ├── ingest.py               # Event batch ingestion script
-│   └── run.sh                  # One-command wrapper
+│   └── load_pos.py             # POS CSV ingestion script
+├── dashboard/
+│   └── live_dashboard.py       # Terminal live metrics dashboard
 ├── tests/
-│   ├── test_api.py             # API endpoint tests
-│   ├── test_models.py          # Schema validation tests
-│   └── test_pipeline.py        # Detection pipeline tests
+│   └── test_api.py             # API endpoint and business logic tests
 ├── docs/
 │   ├── DESIGN.md               # Architecture + AI-assisted decisions
 │   └── CHOICES.md              # 3 key design decisions with reasoning
@@ -399,9 +407,6 @@ pytest tests/ -v --cov=app --cov=pipeline
 
 # Run specific test file
 pytest tests/test_api.py -v
-
-# Run with output
-pytest tests/test_models.py -s
 ```
 
 **Test Coverage Target:** >70% (statement coverage)
@@ -440,15 +445,18 @@ Edit `data/store_layout.json` to define store zones. Each zone is a rectangle in
 
 ```json
 {
-  "zones": {
-    "ZONE_ID": {
-      "x_min": 0,
-      "y_min": 0,
-      "x_max": 1920,
-      "y_max": 1080,
-      "name": "Human-readable name"
+  "zones": [
+    {
+      "zone_id": "ZONE_ID",
+      "zone_name": "Human-readable name",
+      "bbox": {
+        "x_min": 0,
+        "y_min": 0,
+        "x_max": 1920,
+        "y_max": 1080
+      }
     }
-  }
+  ]
 }
 ```
 
