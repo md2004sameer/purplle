@@ -158,7 +158,7 @@ class PersonTracker:
     def _compute_iou(bbox1, bbox2):
         """Compute IoU between two bboxes."""
         x1_min, y1_min, x1_max, y1_max = bbox1
-        x2_min, y2_min, x2_max, x2_max = bbox2
+        x2_min, y2_min, x2_max, y2_max = bbox2
         
         inter_xmin = max(x1_min, x2_min)
         inter_ymin = max(y1_min, y2_min)
