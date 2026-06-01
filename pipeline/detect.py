@@ -242,9 +242,10 @@ class StaffDetector:
         Heuristic staff detection.
         
         Staff characteristics:
-        - Frequent zone transitions
-        - Regular presence across cameras
-        - Minimal billing zone dwell
+        - Frequent zone transitions (4+ unique zones in 20 frames)
+        
+        Note: We do NOT use billing-zone heuristics, as early-funnel customers
+        naturally haven't reached billing yet and should not be flagged as staff.
         """
         if len(zone_history) < 5:
             return False
@@ -252,10 +253,6 @@ class StaffDetector:
         # Too many transitions = likely staff
         unique_zones = len(set(zone_history[-20:]))
         if unique_zones >= 4:
-            return True
-        
-        # Never visits billing = unusual for customer
-        if 'BILLING' not in zone_history[-30:]:
             return True
         
         return False
