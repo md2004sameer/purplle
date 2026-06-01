@@ -201,11 +201,30 @@ class ZoneClassifier:
         Initialize zone classifier.
         
         Args:
+            frame_height: Video frame height in pixels
+            frame_width: Video frame width in pixels
             zones: Dict with zone_id -> {'x_min', 'x_max', 'y_min', 'y_max', 'name'}
+                   (Zone coordinates calibrated for 1920x1080)
         """
-        self.zones = zones
         self.frame_height = frame_height
         self.frame_width = frame_width
+        
+        # Scale zone bounds to match actual frame resolution
+        # Zones are calibrated for 1920x1080, so apply scale factors
+        scale_x = frame_width / 1920.0
+        scale_y = frame_height / 1080.0
+        
+        self.zones = {}
+        for zone_id, zone_def in zones.items():
+            self.zones[zone_id] = {
+                'x_min': zone_def['x_min'] * scale_x,
+                'x_max': zone_def['x_max'] * scale_x,
+                'y_min': zone_def['y_min'] * scale_y,
+                'y_max': zone_def['y_max'] * scale_y,
+                'name': zone_def.get('name', zone_id),
+                'priority': zone_def.get('priority', 'MEDIUM'),
+                'description': zone_def.get('description', ''),
+            }
     
     def classify(self, bbox: Tuple) -> Optional[str]:
         """
