@@ -55,7 +55,7 @@ class Event(Base):
     dwell_ms = Column(Integer, default=0)
     is_staff = Column(Boolean, default=False)
     confidence = Column(Float, nullable=False)
-    metadata = Column(JSON, default={})
+    event_metadata = Column(JSON, default={})
     created_at = Column(DateTime, default=datetime.utcnow)
     
     store = relationship("Store", back_populates="events")

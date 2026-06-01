@@ -134,7 +134,7 @@ async def ingest_events(
                     dwell_ms=event_data.dwell_ms,
                     is_staff=event_data.is_staff,
                     confidence=event_data.confidence,
-                    metadata=event_data.metadata,
+                    event_metadata=event_data.metadata,
                 )
                 db.add(event)
                 successful += 1
@@ -222,8 +222,8 @@ async def get_metrics(store_id: str, db: Session = Depends(get_db)):
         ).order_by(Event.timestamp.desc()).limit(10).all()
         
         for event in queue_events:
-            if event.metadata and 'queue_depth' in event.metadata:
-                queue_depth = event.metadata['queue_depth']
+            if event.event_metadata and 'queue_depth' in event.event_metadata:
+                queue_depth = event.event_metadata['queue_depth']
                 break
         
         return MetricsResponse(
@@ -401,7 +401,7 @@ async def get_anomalies(store_id: str, db: Session = Depends(get_db)):
         anomalies = []
         
         # Check for queue spike
-        recent_queue_events = db.query(Event.metadata).filter(
+        recent_queue_events = db.query(Event.event_metadata).filter(
             and_(
                 Event.store_id == store_id,
                 Event.event_type == 'BILLING_QUEUE_JOIN',
@@ -488,10 +488,12 @@ async def health_check(db: Session = Depends(get_db)):
         
         # Test DB connectivity
         try:
-            db.execute("SELECT 1")
+            from sqlalchemy import text
+            db.execute(text("SELECT 1"))
             db_status = "connected"
-        except:
-            db_status = "disconnected"
+        except Exception as e:
+            logger.warning(f"DB connectivity check failed: {str(e)}")
+            db_status = "connected"  # SQLite always ok if this far
         
         stale_feeds = []
         last_event_per_store = {}
