@@ -135,15 +135,15 @@ class PersonTracker:
                 del self.tracks[tid]
             return updated_tracks
         
-        # Simple IoU-based association — track which detection each track was matched to
-        matched_detections = set()
+        # Simple IoU-based association — prevent multiple detections from matching the same track
+        matched_tracks = set()
         for det_idx, det_bbox in enumerate(detections):
             matched = False
             best_iou = 0.3
             best_id = None
             
             for tid, track in self.tracks.items():
-                if frame_idx - track['last_seen'] <= self.max_age:
+                if tid not in matched_tracks and frame_idx - track['last_seen'] <= self.max_age:
                     iou = self._compute_iou(det_bbox, track['bbox'])
                     if iou > best_iou:
                         best_iou = iou
@@ -158,7 +158,7 @@ class PersonTracker:
                 self.track_history[best_id].append(det_bbox)
                 updated_tracks[best_id] = self.tracks[best_id]
                 matched = True
-                matched_detections.add(det_idx)
+                matched_tracks.add(best_id)
             
             if not matched and len(self.tracks) < self.max_tracks:
                 new_id = self.next_id
@@ -175,7 +175,6 @@ class PersonTracker:
                 }
                 self.track_history[new_id].append(det_bbox)
                 updated_tracks[new_id] = self.tracks[new_id]
-                matched_detections.add(det_idx)
         
         return updated_tracks
     
@@ -557,12 +556,21 @@ class DetectionPipeline:
             for visitor_id, state in list(visitor_states.items()):
                 if (visitor_id not in active_visitor_ids and
                         frame_idx - state['last_frame'] > exit_gap_frames):
-                    exit_ts = datetime.now(timezone.utc) + timedelta(
+                    exit_ts = recording_start + timedelta(
                         seconds=state['last_frame'] / fps
                     )
                     evt = emitter.emit_exit_event(visitor_id, exit_ts)
                     evt['is_staff'] = state['is_staff']
                     exited_visitors[visitor_id] = exit_ts
+                    
+                    # Emit BILLING_QUEUE_ABANDON if visitor was in queue
+                    if visitor_id in queue_members:
+                        queue_depth = len(queue_members) - 1  # Exclude the visitor leaving
+                        queue_evt = emitter.emit_queue_event(
+                            visitor_id, queue_depth, exit_ts, event_type='BILLING_QUEUE_ABANDON'
+                        )
+                        queue_evt['is_staff'] = state['is_staff']
+                    
                     queue_members.discard(visitor_id)
                     del visitor_states[visitor_id]
 
@@ -573,6 +581,14 @@ class DetectionPipeline:
         for visitor_id, state in visitor_states.items():
             evt = emitter.emit_exit_event(visitor_id, end_timestamp)
             evt['is_staff'] = state['is_staff']
+            
+            # Emit BILLING_QUEUE_ABANDON if visitor was in queue
+            if visitor_id in queue_members:
+                queue_depth = len(queue_members) - 1  # Exclude the visitor leaving
+                queue_evt = emitter.emit_queue_event(
+                    visitor_id, queue_depth, end_timestamp, event_type='BILLING_QUEUE_ABANDON'
+                )
+                queue_evt['is_staff'] = state['is_staff']
 
         cap.release()
         

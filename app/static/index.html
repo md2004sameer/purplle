@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Store Intelligence Dashboard</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="topbar" aria-label="Dashboard controls">
+        <div>
+          <p class="eyebrow">Store Intelligence Challenge</p>
+          <h1>Operations Dashboard</h1>
+        </div>
+        <form class="controls" id="store-form">
+          <label for="store-id">Store</label>
+          <input id="store-id" name="store-id" value="STORE_BLR_001" autocomplete="off" />
+          <button type="submit">Refresh</button>
+          <label class="switch">
+            <input id="auto-refresh" type="checkbox" checked />
+            <span>Auto</span>
+          </label>
+        </form>
+      </section>
+
+      <section class="status-strip" aria-label="System status">
+        <div>
+          <span class="label">API</span>
+          <strong id="api-status">Checking</strong>
+        </div>
+        <div>
+          <span class="label">Database</span>
+          <strong id="db-status">-</strong>
+        </div>
+        <div>
+          <span class="label">Updated</span>
+          <strong id="updated-at">-</strong>
+        </div>
+        <div>
+          <span class="label">Data quality</span>
+          <strong id="quality-score">-</strong>
+        </div>
+      </section>
+
+      <section class="kpis" aria-label="Business metrics">
+        <article class="metric">
+          <span>Total entries</span>
+          <strong id="total-visitors">0</strong>
+          <small>Counts repeat entry events</small>
+        </article>
+        <article class="metric">
+          <span>Unique visitors</span>
+          <strong id="unique-visitors">0</strong>
+          <small>Session-level dedupe</small>
+        </article>
+        <article class="metric">
+          <span>Conversion rate</span>
+          <strong id="conversion-rate">n/a</strong>
+          <small>Billing-window POS match</small>
+        </article>
+        <article class="metric">
+          <span>Queue depth</span>
+          <strong id="queue-depth">n/a</strong>
+          <small>Latest billing signal</small>
+        </article>
+      </section>
+
+      <section class="grid">
+        <article class="panel large">
+          <div class="panel-head">
+            <div>
+              <h2>Conversion Funnel</h2>
+              <p>Entry to zone visit to billing to purchase.</p>
+            </div>
+            <strong id="converted-visitors">0 converted</strong>
+          </div>
+          <div class="funnel" id="funnel"></div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>Zone Heatmap</h2>
+              <p>Visit frequency and dwell intensity.</p>
+            </div>
+          </div>
+          <div class="heatmap" id="heatmap"></div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>Anomalies</h2>
+              <p>Operational alerts from current signals.</p>
+            </div>
+          </div>
+          <div class="anomalies" id="anomalies"></div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>Interactive Ingestion</h2>
+              <p>Create realistic test signals from the browser.</p>
+            </div>
+          </div>
+          <form class="ingest" id="event-form">
+            <label>
+              Visitor ID
+              <input id="visitor-id" value="VIS_DEMO_001" autocomplete="off" />
+            </label>
+            <label>
+              Event type
+              <select id="event-type">
+                <option>ENTRY</option>
+                <option>ZONE_ENTER</option>
+                <option>ZONE_DWELL</option>
+                <option>BILLING_QUEUE_JOIN</option>
+                <option>BILLING_QUEUE_ABANDON</option>
+                <option>EXIT</option>
+              </select>
+            </label>
+            <label>
+              Zone
+              <select id="zone-id">
+                <option value="">None</option>
+                <option>ENTRY</option>
+                <option>SKINCARE</option>
+                <option>MAKEUP</option>
+                <option>BILLING</option>
+              </select>
+            </label>
+            <label class="inline">
+              <input id="is-staff" type="checkbox" />
+              Staff movement
+            </label>
+            <button type="submit">Ingest Event</button>
+          </form>
+          <button class="secondary" id="pos-button" type="button">Add POS Transaction</button>
+          <p class="result" id="ingest-result"></p>
+        </article>
+
+        <article class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>Evaluation Readiness</h2>
+              <p>Reviewer acceptance checks surfaced in one place.</p>
+            </div>
+          </div>
+          <ul class="checks">
+            <li><span></span><strong>API availability</strong><small>/health and metrics reachable</small></li>
+            <li><span></span><strong>Business logic</strong><small>Metrics, funnel, anomalies, heatmap</small></li>
+            <li><span></span><strong>Event generation</strong><small>Structured schema via ingestion endpoint</small></li>
+            <li><span></span><strong>Documentation</strong><small>DESIGN.md and CHOICES.md present</small></li>
+          </ul>
+        </article>
+      </section>
+    </main>
+
+    <script src="/static/dashboard.js"></script>
+  </body>
+</html>

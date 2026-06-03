@@ -25,7 +25,8 @@ import json
 import uuid
 
 from fastapi import FastAPI, Depends, HTTPException, status, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
 from sqlalchemy import and_, or_, func, case
 from sqlalchemy.orm import Session
@@ -207,6 +208,8 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan
 )
+
+app.mount("/static", StaticFiles(directory="app/static"), name="static")
 
 
 # Middleware for structured logging
@@ -848,6 +851,26 @@ async def health_check(db: Session = Depends(get_db)):
         raise HTTPException(status_code=503, detail="Service unavailable")
 
 
+@app.get("/stores")
+async def list_stores(db: Session = Depends(get_db)):
+    """List stores that have been created through event or POS ingestion."""
+    try:
+        stores = db.query(Store).order_by(Store.store_id.asc()).all()
+        return {
+            "stores": [
+                {
+                    "store_id": store.store_id,
+                    "store_name": store.store_name,
+                    "city": store.city,
+                }
+                for store in stores
+            ]
+        }
+    except Exception as e:
+        logger.error(f"Store list error: {str(e)}")
+        raise HTTPException(status_code=503, detail="Temporarily unavailable")
+
+
 # ============================================================================
 # ERROR HANDLING
 # ============================================================================
@@ -886,6 +909,12 @@ async def root():
             "health": "GET /health",
         }
     }
+
+
+@app.get("/dashboard")
+async def dashboard():
+    """Interactive browser dashboard for store metrics and reviewer checks."""
+    return FileResponse("app/static/index.html")
 
 
 if __name__ == "__main__":

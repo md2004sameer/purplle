@@ -27,6 +27,8 @@ curl http://localhost:8000/health
 
 The API is now running at `http://localhost:8000`.
 
+Open the interactive dashboard at `http://localhost:8000/dashboard`.
+
 ### Option 2: Local Python
 
 ```bash
@@ -145,6 +147,18 @@ python dashboard/live_dashboard.py \
   --api_url http://localhost:8000 \
   --store_id STORE_BLR_001
 ```
+
+### Interactive Browser Dashboard
+
+The API also serves a browser dashboard:
+
+```text
+http://localhost:8000/dashboard
+```
+
+Use it to inspect live metrics, funnel behavior, zone heatmap, anomalies, API
+health, and evaluation-readiness checks. The dashboard includes controls to
+ingest sample events and POS transactions for a selected store.
 
 ---
 

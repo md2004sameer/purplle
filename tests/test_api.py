@@ -377,6 +377,20 @@ class TestHealthEndpoint:
         assert data["db_status"] in {"connected", "disconnected"}
 
 
+class TestDashboardEndpoints:
+
+    def test_dashboard_serves_html(self, client):
+        resp = client.get("/dashboard")
+        assert resp.status_code == 200
+        assert "Store Intelligence Dashboard" in resp.text
+
+    def test_store_list_contains_ingested_store(self, client):
+        _ingest(client, [_make_event("evt-store-list", "VIS_001")])
+        resp = client.get("/stores")
+        assert resp.status_code == 200
+        assert {"store_id": "STORE_TEST", "store_name": None, "city": None} in resp.json()["stores"]
+
+
 # ---------------------------------------------------------------------------
 # Edge cases
 # ---------------------------------------------------------------------------
